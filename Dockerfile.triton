@@ -1,0 +1,8 @@
+FROM nvcr.io/nvidia/morpheus/morpheus-tritonserver-models:25.06
+
+# Install locales package and generate en_US.UTF-8
+RUN apt-get update && apt-get install -y locales && rm -rf /var/lib/apt/lists/*     && locale-gen en_US.UTF-8     && update-locale LANG=en_US.UTF-8
+
+ENV LANG en_US.UTF-8
+ENV LC_ALL en_US.UTF-8
+

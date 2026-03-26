@@ -1,0 +1,60 @@
+services:
+  triton-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.triton
+    container_name: triton-server
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    ports:
+      - "8889:8000" # HTTP
+      - "8007:8001" # gRPC
+      - "8002:8002" # Metrics
+    volumes:
+      - ./triton-models:/models/triton-model-repo
+    command:
+      - /opt/tritonserver/bin/tritonserver
+      - --model-repository=/models/triton-model-repo
+      - --exit-on-error=false
+      - --model-control-mode=explicit
+      - --load-model=vectorizer
+      - --load-model=model
+      - --load-model=is_security_event_vectorizer
+      - --load-model=is_security_event_model
+      - --load-model=event_type_vectorizer
+      - --load-model=event_type_model
+      - --load-model=priority_vectorizer
+      - --load-model=priority_model
+      - --load-model=cyber_log_pipeline
+      - --backend-config=default:memory_pool_byte_size=2147483648
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  morpheus-inference:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: morpheus-inference
+    network_mode: "host"
+    depends_on:
+      triton-server:
+        condition: service_healthy
+    cap_add:
+      - SYS_NICE
+    environment:
+      KAFKA_BROKER: 10.250.133.29:9092,10.250.133.30:9092,10.250.133.31:9092
+      INPUT_TOPIC: gtt-demo-syslog-input
+      OUTPUT_TOPIC: gtt-demo-syslog-output
+      TRITON_SERVER_URL: localhost:8003
+      MLFLOW_TRACKING_URI: file:///app/models/dfp-models
+    volumes:
+      - ./morpheus_app.py:/app/morpheus_app.py
+      - ./dfp-models:/app/models/dfp-models
+    command: python /app/morpheus_app.py
+
