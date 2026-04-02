@@ -1,54 +1,69 @@
-# Morpheus Inference Pipeline
+# Syslog DFP (Digital Fingerprinting) Pipeline
 
-**Author:** Scott Chrestman
-**Copyright:** 2025 GTT Communications, Inc.
+**Patent Pending -- Copyright 2026 GTT Communications**
+**DO NOT SHARE THIS CODE WITH ANYONE WITHOUT APPROVAL**
 
-This directory contains the NVIDIA Morpheus pipeline for real-time log analysis and anomaly detection.
+A high-performance, GPU-accelerated syslog analysis and anomaly detection system built on **NVIDIA Morpheus**. This pipeline uses the Digital Fingerprinting (DFP) pattern to learn the unique behavioral "fingerprint" of every host in a network and detect security threats or operational failures in real-time.
 
-## Overview
+---
 
-This pipeline consumes log messages from a Kafka topic, performs inference using a Triton Inference Server, and publishes the enriched data back to another Kafka topic. The pipeline is designed to be run in a Docker container and is orchestrated using Docker Compose.
+## 🚀 Overview
 
-The core components are:
--   `morpheus_app.py`: The main Morpheus pipeline script.
--   `Dockerfile`: Defines the Docker image for the Morpheus application.
--   `docker-compose.yaml`: Orchestrates the Morpheus application and the Triton Inference Server.
+The pipeline processes raw syslog messages at extreme throughput, performing deep classification via **NVIDIA Triton** and behavioral anomaly detection via **PyTorch AutoEncoders**. Unlike traditional rule-based systems, this pipeline learns what is "normal" for each specific host and flags deviations across temporal, identity, and content-based dimensions.
 
-The pipeline performs the following steps:
-1.  Reads log messages from the `syslog-test` Kafka topic.
-2.  Sends the log messages to a Triton Inference Server for classification.
-3.  The Triton server uses the trained models to predict the event type, priority, and whether it's a security event.
-4.  The pipeline decodes the model's output (integer labels) back into human-readable strings (e.g., "High", "Authentication").
-5.  The enriched messages are published to the `morpheus-output` Kafka topic.
+---
 
-## Setup
+## 🧠 Anomaly Detection (DFP) Features
 
-### Prerequisites
--   Docker and Docker Compose
--   NVIDIA GPU with CUDA drivers
+The system learns from a **19-dimensional feature vector** for every host. When an anomaly is detected, the pipeline identifies the specific attribute that contributed most to the reconstruction error, providing a human-readable `anomaly_cause`.
 
-### 1. Build and Run the Pipeline
+### 1. Behavioral & Volume
+*   **Volume Anomaly:** Triggered when the log frequency (EPS) for a host significantly deviates from its historical average.
+*   **Severity Spike:** Detects when a host that usually sends `INFO` or `NOTICE` logs suddenly starts emitting `CRITICAL`, `ALERT`, or `EMERGENCY` messages.
+*   **Unusual Event:** Identified when the classified `event_type` (e.g., Authentication, Network, System) is rare for that specific host.
+*   **Security Flag:** Triggered when Triton classifies a log as having a high probability of being a security-relevant event for a host that rarely generates them.
 
-The `docker-compose.yaml` file is configured to build and run both the Triton Inference Server and the Morpheus pipeline.
+### 2. Temporal (Day & Time)
+*   **Time Anomaly (Hour):** Detects execution at unusual hours (e.g., a backup script running at 2:00 PM instead of 2:00 AM). Uses cyclical sine/cosine encoding to ensure the model understands that 23:59 and 00:01 are close together.
+*   **Time Anomaly (Day):** Flags activity on unusual days of the week (e.g., administrative commands executed on a Sunday for a host that is typically only managed during weekdays).
 
-From the `morpheus_pipeline` directory, run:
+### 3. Identity & Metadata
+*   **User Anomaly:** Triggered when a log contains a username (e.g., `admin`, `root`, `service_account`) that is not typically associated with that host.
+*   **Process Anomaly:** Detects activity from an unusual application or service (e.g., `nc` or `nmap` logging on a database server where only `postgres` and `systemd` are normal).
+*   **Message Length Anomaly:** Flags logs that are unusually long or short, which can signify buffer overflows, large command-line arguments, or truncated logs.
 
-```bash
-docker-compose up --build
-```
+### 4. Content & Pattern (Semantic Hashing)
+*   **Log Content Anomaly:** The system maintains 8 independent hashing features (`feature_log_v0` through `feature_log_v7`). These capture the "shape" and vocabulary of the log message itself. This allows the model to detect new types of logs or changes in log structure even if the username or process remains the same.
 
-This command will:
--   Build the custom Triton server image (if `Dockerfile.triton` is present).
--   Build the Morpheus application image.
--   Start both the `triton-server` and `morpheus-app` containers.
+---
 
-### 2. Configuration
+## 🛠 Technology Stack
 
-The pipeline's configuration is managed through environment variables in the `docker-compose.yaml` file. You may need to adjust the following variables to match your environment:
+- **NVIDIA Morpheus:** Core pipeline orchestration.
+- **NVIDIA Triton Inference Server:** Ensemble log classification (is_security, event_type, priority).
+- **PyTorch (AutoEncoders):** Individualized host behavioral models.
+- **MLflow:** Model versioning and lifecycle management.
+- **Apache Kafka:** High-speed streaming ingestion and egress.
+- **cuDF & CuPy:** Zero-copy, GPU-accelerated feature engineering and preprocessing.
+- **FastAPI:** Real-time health monitoring and pipeline status.
 
--   `KAFKA_BROKER`: The address of your Kafka broker.
--   `INPUT_TOPIC`: The Kafka topic to consume messages from.
--   `OUTPUT_TOPIC`: The Kafka topic to publish enriched messages to.
--   `TRITON_SERVER_URL`: The URL of the Triton Inference Server.
+---
 
-**Note:** The `models` directory from the parent directory is mounted as a volume in both the Triton and Morpheus containers. This allows both services to access the trained models and label encoders.
+## 🏗 Pipeline Architecture
+
+1.  **Ingestion:** Consumes raw syslog from Kafka.
+2.  **GPU Preprocessing:** Vectorized regex extraction and cyclical temporal encoding via `cudf`.
+3.  **Triton Classification:** Multi-model ensemble determines the semantic intent of the log.
+4.  **Accumulator:** High-speed GPU batching to optimize DFP inference throughput.
+5.  **Digital Fingerprinting (Inference):** Parallelized AutoEncoder reconstruction across hundreds of host profiles simultaneously in VRAM.
+6.  **Continuous Learning:** Background training of host profiles using `AsyncTrainingStage`, automatically promoting new models into the live inference engine.
+7.  **Egress:** Enriched anomalies (with scores and causes) are pushed to a downstream Kafka topic for visualization or alerting.
+
+---
+
+## 📊 Performance Optimizations
+
+- **Zero-Copy Philosophy:** Data remains in GPU memory (VRAM) from ingestion through inference.
+- **RMM (RAPIDS Memory Manager):** Pooled memory allocation to prevent fragmentation.
+- **Multi-Model Lookup:** Custom GPU-vectorized hash lookup to map logs to host-specific models in `O(1)` time.
+- **Cyclical Encoding:** Ensures temporal continuity for periodic behavioral patterns.

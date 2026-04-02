@@ -115,7 +115,13 @@ MODEL_UPDATED_EVENT = threading.Event()
 # --- DFP FEATURE DEFINITIONS ---
 # We are adding 8 hashing features to capture log message content patterns
 NUM_LOG_FEATURES = 8
+# Core features
 FEATURE_COLS = ["feature_log_count", "feature_priority", "feature_event_type", "feature_is_security_event"]
+# Temporal features (Cyclical Encoding)
+FEATURE_COLS += ["feature_hour_sin", "feature_hour_cos", "feature_day_sin", "feature_day_cos"]
+# Metadata features
+FEATURE_COLS += ["feature_user_hash", "feature_msg_len", "feature_proc_hash"]
+# Content hashing features
 for i in range(NUM_LOG_FEATURES):
     FEATURE_COLS.append(f"feature_log_v{i}")
 NUM_FEATURES = len(FEATURE_COLS)
@@ -296,6 +302,8 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
         super().__init__(c)
         self._ip_regex = r"from\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
         self._host_regex = r"(?:<\d+>)?([A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+([a-zA-Z0-9\.\-_]+)"
+        self._user_regex = r"(?:user|for user|User|User=)\s*([a-zA-Z0-9\.\-_]+)"
+        self._process_regex = r"(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+[a-zA-Z0-9\.\-_]+\s+([a-zA-Z0-9\.\-_]+)(?:\[\d+\])?: "
         
     @property
     def name(self): return "gpu-preprocessing"
@@ -306,6 +314,10 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
         if msg is None: return None
         with msg.payload().mutable_dataframe() as df:
             try:
+                # 0. INITIALIZE ALL FEATURE COLUMNS (Avoid KeyErrors later)
+                for col in FEATURE_COLS:
+                    df[col] = 0.0
+                
                 # 1. EXTRACT SOURCE (IP or Hostname)
                 if "message" in df.columns:
                     msg_col = df["message"]
@@ -314,33 +326,55 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     extracted_ip = msg_col.str.extract(self._ip_regex)[0]
                     df["source"] = extracted_ip.fillna(extracted_host).fillna("unknown_source")
                     
-                    # 2. LOG CONTENT FEATURES (HASHING)
+                    # 2. TEMPORAL & METADATA FEATURES
+                    now_dt = datetime.utcnow()
+                    hour = now_dt.hour
+                    day = now_dt.weekday()
+                    
+                    df["feature_hour_sin"] = np.float32(np.sin(2 * np.pi * hour / 24.0))
+                    df["feature_hour_cos"] = np.float32(np.cos(2 * np.pi * hour / 24.0))
+                    df["feature_day_sin"] = np.float32(np.sin(2 * np.pi * day / 7.0))
+                    df["feature_day_cos"] = np.float32(np.cos(2 * np.pi * day / 7.0))
+                    
+                    df["feature_msg_len"] = (msg_col.str.len() / 512.0).astype("float32").clip(0.0, 1.0)
+                    
+                    # Extract User and Process
+                    users = msg_col.str.extract(self._user_regex)[0].fillna("none")
+                    procs = msg_col.str.extract(self._process_regex)[0].fillna("unknown")
+                    df["feature_user_hash"] = (users.hash_values() % 1000).astype("float32") / 1000.0
+                    df["feature_proc_hash"] = (procs.hash_values() % 1000).astype("float32") / 1000.0
+
+                    # 3. LOG CONTENT FEATURES (HASHING)
                     for i in range(NUM_LOG_FEATURES):
                         df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 1000).astype("float32") / 1000.0
                 else:
                     df["source"] = "unknown_source"
-                    for i in range(NUM_LOG_FEATURES):
-                        df[f"feature_log_v{i}"] = 0.0
 
-                # 3. COMPRESSED TIMESTAMPS FOR DFP
+                # 4. COMPRESSED TIMESTAMPS FOR DFP (Safer Implementation)
                 rows = len(df)
-                time_offsets = cp.arange(rows, dtype='int64') * 1000 
-                base_ts = int(datetime.utcnow().timestamp() * 1e9)
-                df["timestamp"] = (base_ts + time_offsets).astype("datetime64[ns]")
+                if rows > 0:
+                    time_offsets = cp.arange(rows, dtype='int64') * 1000 
+                    base_ts = int(datetime.utcnow().timestamp() * 1e9)
+                    # Convert to datetime using cudf directly
+                    df["timestamp"] = cudf.to_datetime(cp.full(rows, base_ts) + time_offsets, unit='ns')
 
-                # 4. TRITON FEATURE MAPPING
+                # 5. TRITON FEATURE MAPPING
                 duration_sec = max(float(rows) * 1000 / 1e9, 0.001)
                 counts = df['source'].value_counts()
                 df['feature_log_count'] = (df['source'].map(counts) / duration_sec * 60.0 / 2000.0).astype('float32')
 
                 for col in ["priority", "event_type", "is_security_event"]:
-                    df[f"feature_{col}"] = df[col].astype("float32") if col in df.columns else 0.0
+                    if col in df.columns:
+                        df[f"feature_{col}"] = df[col].astype("float32")
 
                 df["anomaly_score"] = -1.0
                 df["mean_abs_err"] = -1.0
                 df["anomaly_cause"] = "analysis_pending" 
             except Exception as e:
-                logger.error(f"Preprocessing Error: {e}")
+                logger.error(f"❌ Preprocessing Error: {e}")
+                import traceback
+                traceback.print_exc()
+        return msg
         return msg
 
     def _build_single(self, builder, input_node):
@@ -624,9 +658,13 @@ class ManualInferenceStage(SinglePortStage):
             pdf_results["mean_abs_err"] = loss_f32.cpu().numpy()
             
             # REASON MAP: Maps the feature index with the highest error to a human-readable cause
-            reason_map = {0: "Volume Anomaly", 1: "Severity Spike", 2: "Unusual Event", 3: "Security Flag"}
-            # Any of the new hashing features point to log content anomalies
-            for i in range(4, NUM_FEATURES):
+            reason_map = {
+                0: "Volume Anomaly", 1: "Severity Spike", 2: "Unusual Event", 3: "Security Flag",
+                4: "Time Anomaly (Hour)", 5: "Time Anomaly (Hour)", 6: "Time Anomaly (Day)", 7: "Time Anomaly (Day)",
+                8: "User Anomaly", 9: "Message Length Anomaly", 10: "Process Anomaly"
+            }
+            # Any of the remaining hashing features point to log content anomalies
+            for i in range(11, NUM_FEATURES):
                 reason_map[i] = "Log Content Anomaly"
 
             pdf_results["anomaly_cause"] = [
