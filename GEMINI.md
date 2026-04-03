@@ -21,6 +21,7 @@ The application is designed for **extreme throughput** (thousands of events per 
 - **MLflow:** Manages the versioning and persistence of host-specific DFP models.
 - **Apache Kafka:** The high-speed ingestion and egress layer.
 - **cuDF / CuPy:** Used for vectorized preprocessing and mathematical operations on the GPU.
+- **FastAPI:** Real-time health monitoring and pipeline status reporting.
 
 ---
 
@@ -29,7 +30,8 @@ The application is designed for **extreme throughput** (thousands of events per 
 ### 1. Ingestion & Preprocessing (`GPUPreprocessingStage`)
 - **Source Extraction:** Uses GPU-accelerated regex (`cudf.Series.str.extract`) to identify the source IP or hostname from raw syslog messages.
 - **Hashing Vectorization:** Generates 8 content-based features by hashing log messages directly on the GPU. This allows the system to "understand" the difference between an SSH login, a sudo command, or a kernel panic without manual rules.
-- **Temporal Compression:** Compresses logs into high-frequency spikes (microsecond spacing) to enhance the DFP model's sensitivity to volume anomalies.
+- **Identity Extraction:** Extracts user and process information from logs and hashes them for feature engineering.
+- **Temporal Encoding:** Uses cyclical sine/cosine encoding for Hour and Day to ensure the model understands temporal continuity.
 
 ### 2. Classification (`StringTritonInferenceStage`)
 - Ensemble inference via Triton to determine:
@@ -41,7 +43,7 @@ The application is designed for **extreme throughput** (thousands of events per 
 ### 3. Digital Fingerprinting (`ManualInferenceStage`)
 - **Dynamic Profile Loading:** Loads and promotes host-specific AutoEncoder models into GPU memory.
 - **Multi-Model Inference:** Performs batched inference across hundreds of different host profiles simultaneously using a custom GPU-vectorized lookup and normalization engine.
-- **Anomaly Attribution:** Identifies the specific cause of an anomaly (e.g., "Log Content Anomaly", "Volume Anomaly") based on which feature had the highest reconstruction error.
+- **Anomaly Attribution:** Identifies the specific cause of an anomaly (e.g., "Log Content Anomaly", "Volume Anomaly", "Time Anomaly (Hour)") based on which feature had the highest reconstruction error.
 
 ### 4. Continuous Learning (`AsyncTrainingStage`)
 - Hosts are automatically identified and queued for training once they accumulate enough data.
@@ -57,9 +59,16 @@ The application is designed for **extreme throughput** (thousands of events per 
 ---
 
 ## 📈 Feature Definition
-The DFP model currently learns from **12 features**:
+The DFP model learns from a **19-dimensional feature vector**:
 1. `feature_log_count`: Log volume frequency.
 2. `feature_priority`: Syslog priority level.
 3. `feature_event_type`: Classified category.
 4. `feature_is_security_event`: Security relevance flag.
-5. `feature_log_v0` - `feature_log_v7`: 8 hashing-based features representing log message content patterns.
+5. `feature_hour_sin`: Cyclical hour encoding (sine).
+6. `feature_hour_cos`: Cyclical hour encoding (cosine).
+7. `feature_day_sin`: Cyclical day encoding (sine).
+8. `feature_day_cos`: Cyclical day encoding (cosine).
+9. `feature_user_hash`: Hashed username.
+10. `feature_proc_hash`: Hashed process name.
+11. `feature_msg_len`: Normalized message length.
+12. `feature_log_v0` - `feature_log_v7`: 8 hashing-based features representing log message content patterns.

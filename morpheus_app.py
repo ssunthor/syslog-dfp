@@ -1,5 +1,5 @@
 # Author: Scott Chrestman
-# Copyright: 2025 GTT Communications, Inc.
+# Copyright: 2026 GTT Communications, Inc.
 
 import os
 import logging
@@ -111,17 +111,19 @@ TRAINING_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 TRAINING_IN_PROGRESS = set()
 TRAINING_SET_LOCK = threading.Lock()
 MODEL_UPDATED_EVENT = threading.Event()
+# ADDED: Global training lock to prevent multiple threads from thrashing the GPU
+TRAINING_LOCK = threading.Lock()
 
 # --- DFP FEATURE DEFINITIONS ---
-# We are adding 8 hashing features to capture log message content patterns
+# We are implementing 19 features as described in the system design
 NUM_LOG_FEATURES = 8
-# Core features
+# Base Behavioral
 FEATURE_COLS = ["feature_log_count", "feature_priority", "feature_event_type", "feature_is_security_event"]
-# Temporal features (Cyclical Encoding)
+# Temporal (Sine/Cosine encoding for Hour and Day)
 FEATURE_COLS += ["feature_hour_sin", "feature_hour_cos", "feature_day_sin", "feature_day_cos"]
-# Metadata features
-FEATURE_COLS += ["feature_user_hash", "feature_msg_len", "feature_proc_hash"]
-# Content hashing features
+# Identity & Metadata
+FEATURE_COLS += ["feature_user_hash", "feature_proc_hash", "feature_msg_len"]
+# Semantic Hashing (8 features)
 for i in range(NUM_LOG_FEATURES):
     FEATURE_COLS.append(f"feature_log_v{i}")
 NUM_FEATURES = len(FEATURE_COLS)
@@ -168,20 +170,24 @@ def warm_up_model_cache():
                         with MLFLOW_LOCK:
                             loaded = mlflow.pytorch.load_model(model_path)
                             
-                            # FEATURE CHECK: Ignore models that don't match the new 12-feature input size
+                            # ROBUST FEATURE CHECK: Determine if this is a 4-feature or 12-feature model
+                            input_size = 0
                             try:
-                                # Check the first layer of the encoder
-                                input_size = 0
-                                if hasattr(loaded, "encoder"):
-                                    input_size = loaded.encoder[0].in_features
-                                elif hasattr(loaded, "layers"):
-                                    input_size = loaded.layers[0].in_features
-                                
-                                if input_size != NUM_FEATURES:
-                                    logger.info(f"⏭️ Skipping {user_id}: Input size {input_size} != {NUM_FEATURES} (Old Version)")
-                                    continue
+                                # 1. Check saved buffers first (most reliable)
+                                if hasattr(loaded, "saved_means"):
+                                    input_size = len(loaded.saved_means)
+                                # 2. Try to find the first Linear layer in any sub-module
+                                if input_size == 0:
+                                    for module in loaded.modules():
+                                        if isinstance(module, torch.nn.Linear):
+                                            input_size = module.in_features
+                                            break
                             except Exception:
                                 pass
+                            
+                            if input_size != NUM_FEATURES:
+                                logger.info(f"⏭️ Skipping {user_id}: Found {input_size} features, need {NUM_FEATURES} (Old Version)")
+                                continue
 
                             if torch.cuda.is_available(): loaded.to("cuda").float()
                             
@@ -257,6 +263,11 @@ class AccumulatorStage(SinglePortStage):
     def _process(self, msg: ControlMessage):
         if msg is None: return None
         
+        # Update pipeline health metrics
+        PIPELINE_HEALTH["last_activity"] = pytime.time()
+        PIPELINE_HEALTH["is_running"] = True
+        PIPELINE_HEALTH["status"] = "processing"
+
         # Keep data on GPU - use msg.payload().df instead of to_pandas
         gdf = msg.payload().df
         self._buffer.append(gdf)
@@ -298,12 +309,11 @@ class AccumulatorStage(SinglePortStage):
 
 @register_stage("gpu-preprocessing")
 class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
+    """Early stage to extract source and generate log content hashes."""
     def __init__(self, c): 
         super().__init__(c)
         self._ip_regex = r"from\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
         self._host_regex = r"(?:<\d+>)?([A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+([a-zA-Z0-9\.\-_]+)"
-        self._user_regex = r"(?:user|for user|User|User=)\s*([a-zA-Z0-9\.\-_]+)"
-        self._process_regex = r"(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+[a-zA-Z0-9\.\-_]+\s+([a-zA-Z0-9\.\-_]+)(?:\[\d+\])?: "
         
     @property
     def name(self): return "gpu-preprocessing"
@@ -314,68 +324,84 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
         if msg is None: return None
         with msg.payload().mutable_dataframe() as df:
             try:
-                # 0. INITIALIZE ALL FEATURE COLUMNS (Avoid KeyErrors later)
-                for col in FEATURE_COLS:
-                    df[col] = 0.0
-                
-                # 1. EXTRACT SOURCE (IP or Hostname)
+                # 1. EXTRACT METADATA & SOURCE
                 if "message" in df.columns:
                     msg_col = df["message"]
-                    # Combined source extraction
-                    extracted_host = msg_col.str.extract(self._host_regex)[1]
-                    extracted_ip = msg_col.str.extract(self._ip_regex)[0]
+                    extracted_host = msg_col.str.extract(self._host_regex, expand=True)[1]
+                    extracted_ip = msg_col.str.extract(self._ip_regex, expand=True)[0]
                     df["source"] = extracted_ip.fillna(extracted_host).fillna("unknown_source")
                     
-                    # 2. TEMPORAL & METADATA FEATURES
-                    now_dt = datetime.utcnow()
-                    hour = now_dt.hour
-                    day = now_dt.weekday()
-                    
-                    df["feature_hour_sin"] = np.float32(np.sin(2 * np.pi * hour / 24.0))
-                    df["feature_hour_cos"] = np.float32(np.cos(2 * np.pi * hour / 24.0))
-                    df["feature_day_sin"] = np.float32(np.sin(2 * np.pi * day / 7.0))
-                    df["feature_day_cos"] = np.float32(np.cos(2 * np.pi * day / 7.0))
-                    
-                    df["feature_msg_len"] = (msg_col.str.len() / 512.0).astype("float32").clip(0.0, 1.0)
-                    
-                    # Extract User and Process
-                    users = msg_col.str.extract(self._user_regex)[0].fillna("none")
-                    procs = msg_col.str.extract(self._process_regex)[0].fillna("unknown")
-                    df["feature_user_hash"] = (users.hash_values() % 1000).astype("float32") / 1000.0
-                    df["feature_proc_hash"] = (procs.hash_values() % 1000).astype("float32") / 1000.0
+                    df["feature_user_hash"] = (msg_col.str.extract(r"(?:user|for|by|USER|FOR|BY)\s+([a-zA-Z0-9_\-\.]+)", expand=True)[0].fillna("no_user").hash_values() % 1000).astype("float32") / 1000.0
+                    df["feature_proc_hash"] = (msg_col.str.extract(r"\s+([a-zA-Z0-9_\-\.]+)(?:\[\d+\])?:", expand=True)[0].fillna("no_proc").hash_values() % 1000).astype("float32") / 1000.0
+                    df["feature_msg_len"] = (msg_col.str.len() / 500.0).astype("float32").clip(0.0, 10.0)
 
-                    # 3. LOG CONTENT FEATURES (HASHING)
                     for i in range(NUM_LOG_FEATURES):
                         df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 1000).astype("float32") / 1000.0
                 else:
                     df["source"] = "unknown_source"
+                    df["feature_user_hash"] = 0.0; df["feature_proc_hash"] = 0.0; df["feature_msg_len"] = 0.0
+                    for i in range(NUM_LOG_FEATURES):
+                        df[f"feature_log_v{i}"] = 0.0
 
-                # 4. COMPRESSED TIMESTAMPS FOR DFP (Safer Implementation)
+                # 2. TEMPORAL FEATURES
+                now = datetime.utcnow()
+                hour = now.hour + now.minute / 60.0
+                day = now.weekday()
+                df["feature_hour_sin"] = float(np.sin(2 * np.pi * hour / 24.0))
+                df["feature_hour_cos"] = float(np.cos(2 * np.pi * hour / 24.0))
+                df["feature_day_sin"] = float(np.sin(2 * np.pi * day / 7.0))
+                df["feature_day_cos"] = float(np.cos(2 * np.pi * day / 7.0))
+
+                # 3. COMPRESSED TIMESTAMPS
                 rows = len(df)
-                if rows > 0:
-                    time_offsets = cp.arange(rows, dtype='int64') * 1000 
-                    base_ts = int(datetime.utcnow().timestamp() * 1e9)
-                    # Convert to datetime using cudf directly
-                    df["timestamp"] = cudf.to_datetime(cp.full(rows, base_ts) + time_offsets, unit='ns')
+                time_offsets = cp.arange(rows, dtype='int64') * 1000 
+                base_ts_int = int(now.timestamp() * 1e9)
+                df["timestamp"] = cudf.to_datetime(time_offsets + base_ts_int, unit="ns")
+            except Exception as e:
+                import traceback
+                logger.error(f"Preprocessing Early Error: {e}\n{traceback.format_exc()}")
+        return msg
 
-                # 5. TRITON FEATURE MAPPING
-                duration_sec = max(float(rows) * 1000 / 1e9, 0.001)
+    def _build_single(self, builder, input_node):
+        node = builder.make_node(self.unique_name, ops.map(self._process))
+        builder.make_edge(input_node, node)
+        return node
+
+@register_stage("gpu-feature-mapping")
+class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
+    """Late stage to map Triton outputs and calculate volume rates."""
+    def __init__(self, c): super().__init__(c)
+    @property
+    def name(self): return "gpu-feature-mapping"
+    def accepted_types(self): return (ControlMessage,)
+    def supports_cpp_node(self): return False
+
+    def _process(self, msg: ControlMessage):
+        if msg is None: return None
+        with msg.payload().mutable_dataframe() as df:
+            try:
+                rows = len(df)
+                # Volume features depend on 'source' from Early stage
+                duration_sec = max(float(rows) * 1000.0 / 1e9, 0.001)
                 counts = df['source'].value_counts()
                 df['feature_log_count'] = (df['source'].map(counts) / duration_sec * 60.0 / 2000.0).astype('float32')
 
+                # Triton features depend on Triton inference
                 for col in ["priority", "event_type", "is_security_event"]:
-                    if col in df.columns:
-                        df[f"feature_{col}"] = df[col].astype("float32")
+                    df[f"feature_{col}"] = df[col].astype("float32") if col in df.columns else 0.0
 
                 df["anomaly_score"] = -1.0
                 df["mean_abs_err"] = -1.0
                 df["anomaly_cause"] = "analysis_pending" 
             except Exception as e:
-                logger.error(f"❌ Preprocessing Error: {e}")
                 import traceback
-                traceback.print_exc()
+                logger.error(f"Preprocessing Late Error: {e}\n{traceback.format_exc()}")
         return msg
-        return msg
+
+    def _build_single(self, builder, input_node):
+        node = builder.make_node(self.unique_name, ops.map(self._process))
+        builder.make_edge(input_node, node)
+        return node
 
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process))
@@ -390,7 +416,7 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
         self._model_cache = {} 
         self._train_counter = {}
         self._last_train_time = {} 
-        self._save_interval = 20
+        self._save_interval = 5
         self._queue_semaphore = threading.Semaphore(64) 
         self._total_msgs_seen = 0
         
@@ -418,15 +444,21 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
                                 with MLFLOW_LOCK:
                                     loaded = mlflow.pytorch.load_model(model_path)
                                     
-                                    # FEATURE CHECK: Ensure we don't load old 4-feature models
+                                    # ROBUST FEATURE CHECK
+                                    input_size = 0
                                     try:
-                                        input_size = 0
-                                        if hasattr(loaded, "encoder"): input_size = loaded.encoder[0].in_features
-                                        elif hasattr(loaded, "layers"): input_size = loaded.layers[0].in_features
-                                        if input_size != NUM_FEATURES:
-                                            logger.info(f"🔄 Migrating {user_id}: Old model has {input_size} features, need {NUM_FEATURES}. Resetting.")
-                                            loaded = None
-                                    except Exception: loaded = None
+                                        if hasattr(loaded, "saved_means"):
+                                            input_size = len(loaded.saved_means)
+                                        if input_size == 0:
+                                            for module in loaded.modules():
+                                                if isinstance(module, torch.nn.Linear):
+                                                    input_size = module.in_features
+                                                    break
+                                    except Exception: pass
+
+                                    if input_size != NUM_FEATURES:
+                                        logger.info(f"🔄 Migrating {user_id}: Old model has {input_size} features, need {NUM_FEATURES}. Resetting.")
+                                        loaded = None
 
                                     if loaded:
                                         if torch.cuda.is_available(): loaded.to("cuda").float()
@@ -445,7 +477,11 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             model = GLOBAL_MODEL_CACHE.get(user_id)
             if not model: return
 
-            model.fit(train_data, epochs=1) 
+            # LOCK: Only one model fit can happen on the GPU at a time to prevent thrashing
+            with TRAINING_LOCK:
+                logger.info(f"🧠 TRAINING: Host {user_id} starting model.fit() on {len(train_data)} logs...")
+                model.fit(train_data, epochs=1) 
+                logger.info(f"🧠 TRAINING COMPLETE: Host {user_id} fit finished.")
             
             data_matrix = train_data.values
             if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
@@ -453,14 +489,35 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
             model.register_buffer("saved_scales", torch.tensor(np.std(data_matrix, axis=0) + 1e-4, dtype=torch.float32, device=device))
             
-            if count == 1 or (count > 0 and count % self._save_interval == 0):
+            if count == 1 or (count > 1 and count % self._save_interval == 0):
+                logger.info(f"💾 SAVING: Host {user_id} Version {count} to MLflow...")
                 with MLFLOW_LOCK:
                     host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
+                    if count == 1:
+                        logger.info(f"🧹 CLEARING: Host {user_id} starting from version 1. Wiping host directory.")
+                        if os.path.exists(host_dir):
+                            shutil.rmtree(host_dir, ignore_errors=True)
+
                     version_dir = os.path.join(host_dir, f"version-{count}")
                     model_save_path = os.path.join(version_dir, "model")
-                    if os.path.exists(model_save_path): shutil.rmtree(model_save_path, ignore_errors=True)
+                    
+                    try:
+                        if os.path.exists(version_dir):
+                            shutil.rmtree(version_dir)
+                    except Exception as e:
+                        logger.warning(f"Could not clear {version_dir}: {e}. Retrying model path only.")
+                        if os.path.exists(model_save_path):
+                            shutil.rmtree(model_save_path, ignore_errors=True)
+
                     os.makedirs(version_dir, exist_ok=True)
-                    mlflow.pytorch.save_model(model, path=model_save_path)
+                    
+                    # Log with requirements to be safe
+                    mlflow.pytorch.save_model(model, path=model_save_path, pip_requirements=["torch", "mlflow", "pandas"])
+                    
+                    with MODEL_CACHE_LOCK:
+                        GLOBAL_TRAIN_COUNTER[user_id] = max(GLOBAL_TRAIN_COUNTER.get(user_id, 0), count)
+                    
+                    logger.info(f"💾 SAVED: Host {user_id} Version {count} to disk at {model_save_path}")
                     MODEL_UPDATED_EVENT.set()
             
             del train_data
@@ -483,7 +540,7 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
 
         # 1. Only train on hosts that have a significant amount of data in this batch
         counts = df[source_col].value_counts()
-        active_hosts = counts[counts >= 100].index.to_arrow().to_pylist()
+        active_hosts = counts[counts >= 50].index.to_arrow().to_pylist()
         
         if not active_hosts: return msg
 
@@ -494,15 +551,24 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             last_train = self._last_train_time.get(user_id, 0)
             if pytime.time() - last_train < 60: continue
             
+            # CHECK: If already training this host, skip to avoid queue buildup
+            with TRAINING_SET_LOCK:
+                if user_id in TRAINING_IN_PROGRESS: continue
+
             if not self._queue_semaphore.acquire(blocking=False): continue
 
-            logger.info(f"⚡ TRAINING START: Host {user_id} (Logs: {counts[user_id]})")
+            # SYNC: Initialize or update local counter from global registry to handle restarts
+            with MODEL_CACHE_LOCK:
+                current_v = max(self._train_counter.get(user_id, 0), GLOBAL_TRAIN_COUNTER.get(user_id, 0))
+                self._train_counter[user_id] = current_v + 1
+
+            count = self._train_counter[user_id]
+            logger.info(f"⚡ TRAINING START: Host {user_id} (Logs: {counts[user_id]}) - Next Version: {count}")
             self._last_train_time[user_id] = pytime.time()
-            self._train_counter[user_id] = self._train_counter.get(user_id, 0) + 1
             
             with TRAINING_SET_LOCK: TRAINING_IN_PROGRESS.add(user_id)
             user_data = pdf[pdf[source_col] == user_id].copy()
-            TRAINING_EXECUTOR.submit(self._train_and_save, user_data, user_id, self._train_counter[user_id])
+            TRAINING_EXECUTOR.submit(self._train_and_save, user_data, user_id, count)
 
         return msg
 
@@ -659,12 +725,20 @@ class ManualInferenceStage(SinglePortStage):
             
             # REASON MAP: Maps the feature index with the highest error to a human-readable cause
             reason_map = {
-                0: "Volume Anomaly", 1: "Severity Spike", 2: "Unusual Event", 3: "Security Flag",
-                4: "Time Anomaly (Hour)", 5: "Time Anomaly (Hour)", 6: "Time Anomaly (Day)", 7: "Time Anomaly (Day)",
-                8: "User Anomaly", 9: "Message Length Anomaly", 10: "Process Anomaly"
+                0: "Volume Anomaly", 
+                1: "Severity Spike", 
+                2: "Unusual Event", 
+                3: "Security Flag",
+                4: "Time Anomaly (Hour)", 
+                5: "Time Anomaly (Hour)", 
+                6: "Time Anomaly (Day)", 
+                7: "Time Anomaly (Day)",
+                8: "User Anomaly", 
+                9: "Process Anomaly", 
+                10: "Message Length Anomaly"
             }
-            # Any of the remaining hashing features point to log content anomalies
-            for i in range(11, NUM_FEATURES):
+            # Any of the 8 hashing features (indices 11-18) point to log content anomalies
+            for i in range(11, 11 + NUM_LOG_FEATURES):
                 reason_map[i] = "Log Content Anomaly"
 
             pdf_results["anomaly_cause"] = [
@@ -924,6 +998,10 @@ def run_inference_pipeline():
     mem_thread = threading.Thread(target=memory_manager_worker, daemon=True)
     mem_thread.start()
 
+    # Start Health Server in background
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
     while True:
         try:
             config = Config()
@@ -942,7 +1020,7 @@ def run_inference_pipeline():
 
             pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=f"morpheus_inf_{uuid.uuid4().hex}"))
             pipeline.add_stage(DeserializeStage(config))
-            pipeline.add_stage(GPUPreprocessingStage(config))
+            pipeline.add_stage(GPUPreprocessingStage(config)) # 1. Early Source/Hash Extraction
             
             inference_outputs = [
                 ColumnInfo(name="label", dtype="int64"),
@@ -953,16 +1031,20 @@ def run_inference_pipeline():
             pipeline.add_stage(StringTritonInferenceStage(config, model_name="cyber_log_pipeline", server_url=TRITON_URL, output_mapping=inference_outputs))
             pipeline.add_stage(DecodeTritonOutputsStage(config, triton_url=TRITON_URL))
             pipeline.add_stage(EnforceConsistencyStage(config))
-            pipeline.add_stage(AccumulatorStage(config))
+            pipeline.add_stage(GPUFeatureMappingStage(config)) # 2. Late Feature Mapping (Volume + Triton)
             
             pipeline.add_stage(AsyncTrainingStage(config))
+            pipeline.add_stage(AccumulatorStage(config))
+            
             pipeline.add_stage(ManualInferenceStage(config))
             pipeline.add_stage(PythonKafkaSink(config, bootstrap_servers=KAFKA_BROKER, output_topic=OUTPUT_TOPIC))
 
             logger.info("🚀 Morpheus DFP Inference Pipeline starting...")
+            PIPELINE_HEALTH["status"] = "running"
             pipeline.run()
         except Exception as e:
             logger.critical(f"🛑 FATAL PIPELINE ERROR: {e}")
+            PIPELINE_HEALTH["status"] = "error"
             logger.info("⏳ Restarting pipeline in 10 seconds...")
             pytime.sleep(10)
         except KeyboardInterrupt:
