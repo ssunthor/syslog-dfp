@@ -271,6 +271,14 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             model = GLOBAL_MODEL_CACHE.get(user_id)
             if not model: return
             with TRAINING_LOCK: model.fit(train_data, epochs=1) 
+            
+            # SYNC: Update global counter so inference engine knows we have progressed
+            with MODEL_CACHE_LOCK:
+                GLOBAL_TRAIN_COUNTER[user_id] = max(GLOBAL_TRAIN_COUNTER.get(user_id, 0), count)
+            
+            # SIGNAL: Notify inference engine that metadata (version/means) has changed
+            MODEL_UPDATED_EVENT.set()
+
             data_matrix = train_data.values
             if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -340,7 +348,9 @@ class ManualInferenceStage(SinglePortStage):
         hashes_torch = torch.as_tensor(hashes_cupy, device="cuda").to(torch.int64)
         self.sorted_hashes, sort_order = torch.sort(hashes_torch)
         self.sorted_indices = torch.arange(len(sources), device="cuda")[sort_order]
-        logger.info(f"✅ GPU MODELS READY. Profiles: {len(sources)}")
+        
+        avg_v = sum(versions) / len(versions) if versions else 0
+        logger.info(f"✅ GPU MODELS READY. Profiles: {len(sources)} | Max Version: {max(versions) if versions else 0} | Avg Version: {avg_v:.1f}")
     @property
     def name(self): return "manual-inference"
     def accepted_types(self): return (ControlMessage,)
