@@ -419,7 +419,7 @@ class PythonKafkaSink(SinglePortStage):
 
 @register_stage("decode-triton-outputs")
 class DecodeTritonOutputsStage(PassThruTypeMixin, SinglePortStage):
-    def __init__(self, c, triton_url, model_dir="models"):
+    def __init__(self, c, triton_url, model_dir=os.environ.get("INFERENCE_MODELS_DIR", "/app/models/inference")):
         super().__init__(c); self.decode_maps = {}
         try:
             import sklearn.preprocessing
@@ -437,8 +437,16 @@ class DecodeTritonOutputsStage(PassThruTypeMixin, SinglePortStage):
         def decode(msg):
             if msg:
                 with msg.payload().mutable_dataframe() as df:
+                    decoded_cols = []
                     for col, tgt, key in [("label","main_label","main"),("is_security_event","is_security_event_str","sec"),("event_type","event_type_str","type"),("priority","priority_str","prio")]:
-                        if col in df.columns and key in self.decode_maps: df[tgt] = df[col].astype("int32").map(self.decode_maps[key])
+                        if col in df.columns and key in self.decode_maps:
+                            df[tgt] = df[col].astype("int32").map(self.decode_maps[key])
+                            decoded_cols.append(tgt)
+                    if decoded_cols:
+                        logger.info(f"🏷️ DECODED TRITON OUTPUTS: {decoded_cols} for {len(df)} rows")
+                        if len(df) > 0:
+                            sample = df[decoded_cols].iloc[0].to_dict()
+                            logger.info(f"🧪 SAMPLE DECODE: {sample}")
             return msg
         node = builder.make_node(self.unique_name, ops.map(decode)); builder.make_edge(input_node, node); return node
 
@@ -453,11 +461,12 @@ class EnforceConsistencyStage(PassThruTypeMixin, SinglePortStage):
         def enforce(msg):
             if msg:
                 with msg.payload().mutable_dataframe() as df:
-                    if "main_label" in df.columns:
-                        mask = (df['main_label'].fillna("").str.contains("NON_SECURITY")) & (df.get('is_security_event_str', '') == "True")
+                    if "main_label" in df.columns and "is_security_event_str" in df.columns:
+                        mask = (df['main_label'].fillna("").str.contains("NON_SECURITY")) & (df['is_security_event_str'] == "True")
                         if mask.any(): 
                             df.loc[mask, 'is_security_event_str'] = "False"
-                            df.loc[mask, 'event_type_str'] = "Normal Nonsecurity Event"
+                            if "event_type_str" in df.columns:
+                                df.loc[mask, 'event_type_str'] = "Normal Nonsecurity Event"
             return msg
         node = builder.make_node(self.unique_name, ops.map(enforce)); builder.make_edge(input_node, node); return node
 
@@ -470,10 +479,23 @@ class StringTritonInferenceStage(TritonInferenceStage):
     def _ensure_client(self):
         from tritonclient.grpc import InferenceServerClient
         if self._client is None:
-            try: self._client = InferenceServerClient(url=self._server_url, verbose=False)
-            except: return False
-        try: return self._client.is_server_live()
-        except: self._client = None; return False
+            try:
+                # Sanitize URL: Remove http:// and trailing slashes for gRPC
+                sanitized_url = self._server_url.replace("http://", "").replace("https://", "").rstrip("/")
+                self._client = InferenceServerClient(url=sanitized_url, verbose=False)
+                logger.info(f"✅ Created Triton client for {sanitized_url}")
+            except Exception as e:
+                logger.error(f"❌ Failed to create Triton client for {self._server_url}: {e}")
+                return False
+        try:
+            is_live = self._client.is_server_live()
+            if not is_live:
+                logger.warning(f"⚠️ Triton server {self._server_url} is not live.")
+            return is_live
+        except Exception as e:
+            logger.error(f"❌ Error checking Triton server liveness at {self._server_url}: {e}")
+            self._client = None
+            return False
     def init(self): self._ensure_client()
     def stop(self): 
         if self._client: self._client.close(); self._client = None
@@ -485,17 +507,33 @@ class StringTritonInferenceStage(TritonInferenceStage):
         meta = batch.payload()
         if self._ensure_client():
             try:
+                # Sanitize URL for logging as well
+                sanitized_url = self._server_url.replace("http://", "").replace("https://", "").rstrip("/")
                 with meta.mutable_dataframe() as df:
-                    msg_array = df["message"].to_arrow().to_numpy().astype(object).reshape(-1, 1)
+                    batch_size = len(df)
+                    logger.info(f"🔵 TRITON CALL: model={self._model_name}, batch_size={batch_size}, server={sanitized_url}")
+                    
+                    # Use to_pandas() to avoid 'zero_copy_only' issues with to_arrow() for strings
+                    msg_array = df["message"].to_pandas().values.astype(object).reshape(-1, 1)
+                    
                     from tritonclient.grpc import InferInput, InferRequestedOutput
                     inputs = [InferInput("input_message", msg_array.shape, "BYTES")]
                     inputs[0].set_data_from_numpy(msg_array)
                     outputs = [InferRequestedOutput(out.name) for out in self.output_mapping]
+                    
+                    start_time = pytime.time()
                     response = self._client.infer(self._model_name, inputs, outputs=outputs)
+                    elapsed = (pytime.time() - start_time) * 1000
+                    
+                    logger.info(f"🟢 TRITON RESP: OK (time={elapsed:.2f}ms)")
+                    
                     for out in self.output_mapping:
                         result = response.as_numpy(out.name)
-                        if result is not None: df[out.name] = result.tolist()
-            except: pass
+                        if result is not None: df[out.name] = result.flatten()
+            except Exception as e:
+                logger.error(f"❌ Triton inference failed: {e}")
+        else:
+            logger.error(f"❌ Skipping Triton inference because server {self._server_url} is unreachable.")
         cb(batch); return
 
 def run_inference_pipeline():
