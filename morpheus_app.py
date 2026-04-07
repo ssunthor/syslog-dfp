@@ -283,7 +283,7 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
-            model.register_buffer("saved_scales", torch.tensor(np.std(data_matrix, axis=0) + 1e-4, dtype=torch.float32, device=device))
+            model.register_buffer("saved_scales", torch.tensor(np.std(data_matrix, axis=0) + 0.05, dtype=torch.float32, device=device))
             if count == 1 or (count > 0 and count % self._save_interval == 0):
                 with MLFLOW_LOCK:
                     host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
@@ -325,32 +325,24 @@ class ManualInferenceStage(SinglePortStage):
         super().__init__(c); self._debug_counter = 0; self.target_batch_size = 4096; self.max_latency_sec = 1.0      
         self._buffer = []; self._buffer_count = 0; self._last_flush_time = pytime.time(); self._gc_anchor = collections.deque(maxlen=5) 
         self._last_reload = pytime.time(); self._min_reload_cooldown = 120.0 
-        self.generic_model = torch.nn.Sequential(
-            torch.nn.Linear(NUM_FEATURES, 64), torch.nn.ReLU(),
-            torch.nn.Linear(64, 32), torch.nn.ReLU(),
-            torch.nn.Linear(32, 64), torch.nn.ReLU(),
-            torch.nn.Linear(64, NUM_FEATURES)
-        )
-        if torch.cuda.is_available(): self.generic_model.to("cuda").float()
         self._build_gpu_lookups()
     def _build_gpu_lookups(self):
         logger.info(f"⏳ RELOAD: Syncing GPU from Global Cache...")
         fallback_mean = [0.5] * NUM_FEATURES; fallback_std = [0.1] * NUM_FEATURES
-        sources = ["UNKNOWN_FALLBACK"]; means = [fallback_mean]; stds = [fallback_std]; versions = [0]
+        self.sources = ["UNKNOWN_FALLBACK"]; means = [fallback_mean]; stds = [fallback_std]; versions = [0]
         with MODEL_CACHE_LOCK:
             for user_id, model in GLOBAL_MODEL_CACHE.items():
                 if hasattr(model, "saved_means") and len(model.saved_means) == NUM_FEATURES:
-                    sources.append(user_id); means.append(model.saved_means.tolist()); stds.append(model.saved_scales.tolist()); versions.append(GLOBAL_TRAIN_COUNTER.get(user_id, 0))
+                    self.sources.append(user_id); means.append(model.saved_means.tolist()); stds.append(model.saved_scales.tolist()); versions.append(GLOBAL_TRAIN_COUNTER.get(user_id, 0))
         self.gpu_means = torch.tensor(means, device="cuda", dtype=torch.float32)
         self.gpu_stds = torch.tensor(stds, device="cuda", dtype=torch.float32)
         self.gpu_versions = torch.tensor(versions, device="cuda", dtype=torch.int32)
-        source_series = cudf.Series(sources); hashes_cupy = source_series.hash_values().values 
+        source_series = cudf.Series(self.sources); hashes_cupy = source_series.hash_values().values 
         hashes_torch = torch.as_tensor(hashes_cupy, device="cuda").to(torch.int64)
         self.sorted_hashes, sort_order = torch.sort(hashes_torch)
-        self.sorted_indices = torch.arange(len(sources), device="cuda")[sort_order]
-        
+        self.sorted_indices = torch.arange(len(self.sources), device="cuda")[sort_order]
         avg_v = sum(versions) / len(versions) if versions else 0
-        logger.info(f"✅ GPU MODELS READY. Profiles: {len(sources)} | Max Version: {max(versions) if versions else 0} | Avg Version: {avg_v:.1f}")
+        logger.info(f"✅ GPU MODELS READY. Profiles: {len(self.sources)} | Max Version: {max(versions) if versions else 0}")
     @property
     def name(self): return "manual-inference"
     def accepted_types(self): return (ControlMessage,)
@@ -372,8 +364,57 @@ class ManualInferenceStage(SinglePortStage):
             stats_ids = torch.where(self.sorted_hashes[search_idx] == batch_hashes, self.sorted_indices[search_idx], torch.tensor(0, device="cuda"))
             batch_means = self.gpu_means[stats_ids]; batch_stds = self.gpu_stds[stats_ids]
             normalized_input = (input_tensor - batch_means) / batch_stds
+            
+            reconstruction = torch.zeros_like(normalized_input)
+            unique_ids = stats_ids.unique()
+            for sid in unique_ids:
+                sid_item = int(sid.item())
+                if sid_item == 0: continue
+                mask = (stats_ids == sid)
+                user_id = self.sources[sid_item]
+                with MODEL_CACHE_LOCK:
+                    model = GLOBAL_MODEL_CACHE.get(user_id)
+                if model:
+                    # DIAGNOSTIC: Log attributes once to identify correct inference method
+                    if self._debug_counter == 0:
+                        logger.info(f"🔎 DIAGNOSTIC: Model type={type(model)} | Attributes={dir(model)}")
+                        if hasattr(model, "model"): logger.info(f"🔎 DIAGNOSTIC: model.model type={type(model.model)} | Attributes={dir(model.model)}")
+                        self._debug_counter += 1
+
+                    with torch.no_grad():
+                        try:
+                            # Use the internal AEModule directly
+                            if hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
+                                # AEModule expects a Tensor, not a tuple
+                                out = model.model(normalized_input[mask])
+                                # If the model has multiple heads, it returns a tuple (categorical, numerical)
+                                # We only have numerical features, so we take the numerical head (index 1 or 0)
+                                if isinstance(out, tuple):
+                                    # Dynamically find the tensor that matches our feature count
+                                    target_width = normalized_input[mask].shape[1]
+                                    found = False
+                                    for o in out:
+                                        if hasattr(o, "shape") and len(o.shape) > 1 and o.shape[1] == target_width:
+                                            reconstruction[mask] = o
+                                            found = True
+                                            break
+                                    if not found:
+                                        reconstruction[mask] = out[1] if len(out) > 1 else out[0]
+                                else:
+                                    reconstruction[mask] = out
+                            elif hasattr(model, "reconstruct"):
+                                reconstruction[mask] = model.reconstruct(normalized_input[mask])
+                            elif hasattr(model, "encoder") and hasattr(model, "decoder"):
+                                reconstruction[mask] = model.decoder(model.encoder(normalized_input[mask]))
+                            else:
+                                reconstruction[mask] = model(normalized_input[mask])
+                        except Exception as e:
+                            if self._debug_counter < 10:
+                                logger.warning(f"❌ Inference Fallback for {user_id}: {e} (Pattern failed)")
+                                self._debug_counter += 1
+                            reconstruction[mask] = normalized_input[mask] # Fallback to identity
+            
             with torch.no_grad():
-                reconstruction = self.generic_model(normalized_input)
                 raw_errors = torch.abs(normalized_input - reconstruction)
                 max_val, max_indices = torch.max(raw_errors, dim=1)
                 loss_f32 = torch.mean(raw_errors, dim=1).to(torch.float32); reason_codes = max_indices.cpu().numpy()
