@@ -167,7 +167,7 @@ class AccumulatorStage(SinglePortStage):
     def __init__(self, c):
         super().__init__(c)
         self._buffer = []; self._count = 0; self._last_flush = pytime.time()
-        self.batch_size = 4096; self.max_latency = 1.0; self.max_buffer_size = 8192 
+        self.batch_size = 16384; self.max_latency = 1.0; self.max_buffer_size = 32768 
         self._perf_last_time = pytime.time()
     @property
     def name(self): return "accumulator"
@@ -424,14 +424,34 @@ class ManualInferenceStage(SinglePortStage):
                 if s <= 0: return 0.0
                 if s <= 2.0: return s
                 return min(2.0 + np.log1p(s - 2.0) * 2.0, 10.0)
-            scores_cpu = np.vectorize(scale_score)(scores_cpu); pdf_results = big_df.to_pandas()
-            pdf_results["anomaly_score"] = scores_cpu; pdf_results["mean_abs_err"] = loss_f32.cpu().numpy()
+            # 5. POST-PROCESSING (Scaling) - GPU VECTORIZED
+            scores_cp = cp.asarray(loss_f32)
+            is_learning_cp = cp.asarray(is_learning)
+            
+            # Vectorized scaling: if s > 2.0: 2.0 + log1p(s-2.0)*2.0, else s
+            scaled_scores = cp.where(scores_cp <= 2.0, scores_cp, 2.0 + cp.log1p(cp.maximum(0, scores_cp - 2.0)) * 2.0)
+            scaled_scores = cp.where(scores_cp <= 0, 0.0, scaled_scores)
+            scaled_scores = cp.where(is_learning_cp, 0.0, cp.clip(scaled_scores, 0.0, 10.0))
+            
+            # 6. REASON MAPPING - STAY ON GPU
             reason_map = {0: "Volume Anomaly", 1: "Severity Spike", 2: "Unusual Event", 3: "Security Flag",
                          4: "Time Anomaly (Hour)", 5: "Time Anomaly (Hour)", 6: "Time Anomaly (Day)", 7: "Time Anomaly (Day)",
                          8: "User Anomaly", 9: "Message Length Anomaly", 10: "Process Anomaly"}
             for i in range(11, NUM_FEATURES): reason_map[i] = "Log Content Anomaly"
-            pdf_results["anomaly_cause"] = ["Learning..." if is_learning[i] else reason_map.get(int(reason_codes[i]), "Unknown") for i in range(len(is_learning))]
-            new_meta = MessageMeta(cudf.DataFrame.from_pandas(pdf_results)); self._gc_anchor.append(new_meta); return new_meta
+            
+            # Update results directly in cuDF (Zero-Copy)
+            big_df["anomaly_score"] = scaled_scores
+            big_df["mean_abs_err"] = scores_cp
+            
+            # Vectorized reason mapping using cuDF
+            reason_series = cudf.Series(reason_codes)
+            big_df["anomaly_cause"] = reason_series.map(reason_map).fillna("Unknown")
+            
+            # Handle "Learning..." state
+            is_learning_gdf = cudf.Series(is_learning_cp)
+            big_df.loc[is_learning_gdf, "anomaly_cause"] = "Learning..."
+            
+            new_meta = MessageMeta(big_df); self._gc_anchor.append(new_meta); return new_meta
         except Exception as e: logger.error(f"❌ Inference Flush Error: {e}"); self._buffer = []; self._buffer_count = 0; return None
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
@@ -450,8 +470,10 @@ class PythonKafkaSink(SinglePortStage):
         if msg is None: return None
         try:
             with msg.mutable_dataframe() as df:
-                records = df.to_pandas().to_dict(orient='records')
-                for record in records: self._producer.produce(self._topic, json.dumps(record, default=str).encode('utf-8'))
+                # OPTIMIZATION: Use to_json() with lines=True for faster serialization than to_dict loop
+                json_batch = df.to_pandas().to_json(orient='records', lines=True, date_format='iso')
+                for line in json_batch.splitlines():
+                    if line: self._producer.produce(self._topic, line.encode('utf-8'))
                 self._producer.poll(0)
         except Exception as e: logger.error(f"❌ Kafka Sink Error: {e}")
         return msg
@@ -514,7 +536,7 @@ class EnforceConsistencyStage(PassThruTypeMixin, SinglePortStage):
 class StringTritonInferenceStage(TritonInferenceStage):
     def __init__(self, c, model_name, server_url, output_mapping):
         super().__init__(c, model_name=model_name, server_url=server_url, force_convert_inputs=True)
-        self.output_mapping = output_mapping; self._client = None
+        self.output_mapping = output_mapping; self._client = None; self._debug_counter = 0
     def supports_cpp_node(self): return False
     def _get_inference_worker(self, inf_queue): return self
     def _ensure_client(self):
@@ -548,13 +570,17 @@ class StringTritonInferenceStage(TritonInferenceStage):
         meta = batch.payload()
         if self._ensure_client():
             try:
-                # Sanitize URL for logging as well
-                sanitized_url = self._server_url.replace("http://", "").replace("https://", "").rstrip("/")
                 with meta.mutable_dataframe() as df:
                     batch_size = len(df)
-                    logger.info(f"🔵 TRITON CALL: model={self._model_name}, batch_size={batch_size}, server={sanitized_url}")
                     
-                    # Use to_pandas() to avoid 'zero_copy_only' issues with to_arrow() for strings
+                    # DEBUG: Throttled Logging (Every 100 batches)
+                    do_log = (self._debug_counter % 100 == 0)
+                    self._debug_counter += 1
+                    
+                    if do_log:
+                        logger.info(f"🔵 TRITON CALL: model={self._model_name}, batch_size={batch_size}")
+                    
+                    # to_pandas() is required for strings as to_arrow() often enforces zero_copy_only
                     msg_array = df["message"].to_pandas().values.astype(object).reshape(-1, 1)
                     
                     from tritonclient.grpc import InferInput, InferRequestedOutput
@@ -562,15 +588,22 @@ class StringTritonInferenceStage(TritonInferenceStage):
                     inputs[0].set_data_from_numpy(msg_array)
                     outputs = [InferRequestedOutput(out.name) for out in self.output_mapping]
                     
-                    start_time = pytime.time()
                     response = self._client.infer(self._model_name, inputs, outputs=outputs)
-                    elapsed = (pytime.time() - start_time) * 1000
                     
-                    logger.info(f"🟢 TRITON RESP: OK (time={elapsed:.2f}ms)")
-                    
+                    if do_log:
+                        samples = min(3, batch_size)
+                        for i in range(samples):
+                            msg_peek = str(msg_array[i][0])[:60].replace("\n", " ")
+                            results_peek = {out.name: response.as_numpy(out.name)[i] for out in self.output_mapping}
+                            logger.info(f"   Sample {i}: '{msg_peek}...' -> {results_peek}")
+
                     for out in self.output_mapping:
                         result = response.as_numpy(out.name)
-                        if result is not None: df[out.name] = result.flatten()
+                        if result is not None:
+                            # OPTIMIZATION: Assign numpy array directly to cudf (Zero-copy where possible)
+                            df[out.name] = result.flatten()
+                            # CRITICAL: Map to feature column so ManualInferenceStage can see it!
+                            df[f"feature_{out.name}"] = df[out.name].astype("float32")
             except Exception as e:
                 logger.error(f"❌ Triton inference failed: {e}")
         else:
@@ -583,7 +616,7 @@ def run_inference_pipeline():
     warm_up_model_cache(); threading.Thread(target=memory_manager_worker, daemon=True).start(); threading.Thread(target=run_health_server, daemon=True).start()
     while True:
         try:
-            config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = 16384; config.edge_buffer_size = 16384; config.mode = "AE"; config.num_threads = 8
+            config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = 32768; config.edge_buffer_size = 32768; config.mode = "AE"; config.num_threads = 8
             KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092"); INPUT_TOPIC = os.environ.get("INPUT_TOPIC", "kafka_input"); OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", "kafka_output"); TRITON_URL = os.environ.get("TRITON_SERVER_URL", "localhost:8001")
             pipeline = LinearPipeline(config); pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=f"morpheus_inf_{uuid.uuid4().hex}"))
             pipeline.add_stage(DeserializeStage(config)); pipeline.add_stage(GPUPreprocessingStage(config))
