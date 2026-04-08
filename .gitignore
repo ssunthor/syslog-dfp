@@ -1,3 +1,4 @@
 dfp-models/*
 *.bak
 *.tmp
+ingest-syslog/
