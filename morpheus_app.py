@@ -470,10 +470,15 @@ class PythonKafkaSink(SinglePortStage):
         if msg is None: return None
         try:
             with msg.mutable_dataframe() as df:
-                # OPTIMIZATION: Use to_json() with lines=True for faster serialization than to_dict loop
-                json_batch = df.to_pandas().to_json(orient='records', lines=True, date_format='iso')
-                for line in json_batch.splitlines():
-                    if line: self._producer.produce(self._topic, line.encode('utf-8'))
+                # OPTIMIZATION: Use to_json() with lines=True for faster serialization
+                pdf = df.to_pandas()
+                keys = pdf['source'].values
+                json_batch = pdf.to_json(orient='records', lines=True, date_format='iso')
+                
+                for key, line in zip(keys, json_batch.splitlines()):
+                    if line:
+                        # KEYED PRODUCTION: Ensures host-stickiness across partitions
+                        self._producer.produce(self._topic, value=line.encode('utf-8'), key=str(key).encode('utf-8'))
                 self._producer.poll(0)
         except Exception as e: logger.error(f"❌ Kafka Sink Error: {e}")
         return msg
@@ -617,8 +622,15 @@ def run_inference_pipeline():
     while True:
         try:
             config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = 32768; config.edge_buffer_size = 32768; config.mode = "AE"; config.num_threads = 8
-            KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092"); INPUT_TOPIC = os.environ.get("INPUT_TOPIC", "kafka_input"); OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", "kafka_output"); TRITON_URL = os.environ.get("TRITON_SERVER_URL", "localhost:8001")
-            pipeline = LinearPipeline(config); pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=f"morpheus_inf_{uuid.uuid4().hex}"))
+            KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
+            KAFKA_GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "morpheus_syslog_dfp_v1")
+            INPUT_TOPIC = os.environ.get("INPUT_TOPIC", "kafka_input")
+            OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", "kafka_output")
+            TRITON_URL = os.environ.get("TRITON_SERVER_URL", "localhost:8001")
+
+            pipeline = LinearPipeline(config)
+            # CONSISTENT GROUP ID: Allows multi-pod scaling across partitions
+            pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=KAFKA_GROUP_ID))
             pipeline.add_stage(DeserializeStage(config)); pipeline.add_stage(GPUPreprocessingStage(config))
             pipeline.add_stage(StringTritonInferenceStage(config, model_name="cyber_log_pipeline", server_url=TRITON_URL, output_mapping=[ColumnInfo(name="label", dtype="int64"), ColumnInfo(name="is_security_event", dtype="int64"), ColumnInfo(name="event_type", dtype="int64"), ColumnInfo(name="priority", dtype="int64")]))
             pipeline.add_stage(DecodeTritonOutputsStage(config, triton_url=TRITON_URL)); pipeline.add_stage(EnforceConsistencyStage(config)); pipeline.add_stage(GPUFeatureMappingStage(config))
