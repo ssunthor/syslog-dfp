@@ -322,8 +322,7 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
 @register_stage("manual-inference")
 class ManualInferenceStage(SinglePortStage):
     def __init__(self, c):
-        super().__init__(c); self._debug_counter = 0; self.target_batch_size = 4096; self.max_latency_sec = 1.0      
-        self._buffer = []; self._buffer_count = 0; self._last_flush_time = pytime.time(); self._gc_anchor = collections.deque(maxlen=5) 
+        super().__init__(c); self._debug_counter = 0; self._gc_anchor = collections.deque(maxlen=5) 
         self._last_reload = pytime.time(); self._min_reload_cooldown = 120.0 
         self._build_gpu_lookups()
     def _build_gpu_lookups(self):
@@ -353,11 +352,9 @@ class ManualInferenceStage(SinglePortStage):
         try:
             if MODEL_UPDATED_EVENT.is_set() and (pytime.time() - self._last_reload > self._min_reload_cooldown):
                 MODEL_UPDATED_EVENT.clear(); self._build_gpu_lookups(); self._last_reload = pytime.time()
-            with msg.payload().mutable_dataframe() as df:
-                self._buffer.append(df.copy()); self._buffer_count += len(df)
-            now = pytime.time()
-            if self._buffer_count < self.target_batch_size and (now - self._last_flush_time < self.max_latency_sec): return None
-            big_df = cudf.concat(self._buffer); self._buffer = []; self._buffer_count = 0; self._last_flush_time = now
+            
+            # Process the batch directly from the ControlMessage (AccumulatorStage handled batching)
+            big_df = msg.payload().df
             input_tensor = torch.as_tensor(big_df[FEATURE_COLS].values, device='cuda', dtype=torch.float32)
             batch_hashes = torch.as_tensor(big_df["source"].hash_values().values, device="cuda").to(torch.int64)
             search_idx = torch.searchsorted(self.sorted_hashes, batch_hashes).clamp(0, len(self.sorted_hashes) - 1)
@@ -375,44 +372,24 @@ class ManualInferenceStage(SinglePortStage):
                 with MODEL_CACHE_LOCK:
                     model = GLOBAL_MODEL_CACHE.get(user_id)
                 if model:
-                    # DIAGNOSTIC: Log attributes once to identify correct inference method
-                    if self._debug_counter == 0:
-                        logger.info(f"🔎 DIAGNOSTIC: Model type={type(model)} | Attributes={dir(model)}")
-                        if hasattr(model, "model"): logger.info(f"🔎 DIAGNOSTIC: model.model type={type(model.model)} | Attributes={dir(model.model)}")
-                        self._debug_counter += 1
-
                     with torch.no_grad():
                         try:
-                            # Use the internal AEModule directly
                             if hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
-                                # AEModule expects a Tensor, not a tuple
                                 out = model.model(normalized_input[mask])
-                                # If the model has multiple heads, it returns a tuple (categorical, numerical)
-                                # We only have numerical features, so we take the numerical head (index 1 or 0)
                                 if isinstance(out, tuple):
-                                    # Dynamically find the tensor that matches our feature count
                                     target_width = normalized_input[mask].shape[1]
-                                    found = False
                                     for o in out:
                                         if hasattr(o, "shape") and len(o.shape) > 1 and o.shape[1] == target_width:
                                             reconstruction[mask] = o
-                                            found = True
                                             break
-                                    if not found:
-                                        reconstruction[mask] = out[1] if len(out) > 1 else out[0]
                                 else:
                                     reconstruction[mask] = out
                             elif hasattr(model, "reconstruct"):
                                 reconstruction[mask] = model.reconstruct(normalized_input[mask])
-                            elif hasattr(model, "encoder") and hasattr(model, "decoder"):
-                                reconstruction[mask] = model.decoder(model.encoder(normalized_input[mask]))
                             else:
                                 reconstruction[mask] = model(normalized_input[mask])
-                        except Exception as e:
-                            if self._debug_counter < 10:
-                                logger.warning(f"❌ Inference Fallback for {user_id}: {e} (Pattern failed)")
-                                self._debug_counter += 1
-                            reconstruction[mask] = normalized_input[mask] # Fallback to identity
+                        except Exception:
+                            reconstruction[mask] = normalized_input[mask]
             
             with torch.no_grad():
                 raw_errors = torch.abs(normalized_input - reconstruction)
@@ -630,11 +607,23 @@ def run_inference_pipeline():
 
             pipeline = LinearPipeline(config)
             # CONSISTENT GROUP ID: Allows multi-pod scaling across partitions
-            pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=KAFKA_GROUP_ID))
-            pipeline.add_stage(DeserializeStage(config)); pipeline.add_stage(GPUPreprocessingStage(config))
+            pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=KAFKA_GROUP_ID, auto_offset_reset="latest"))
+            
+            pipeline.add_stage(DeserializeStage(config))
+            
+            # ACCUMULATOR AT THE FRONT: Ensures all downstream stages work on large batches
+            # This is critical for high-throughput Triton and GPU Preprocessing
+            pipeline.add_stage(AccumulatorStage(config))
+            
+            pipeline.add_stage(GPUPreprocessingStage(config))
             pipeline.add_stage(StringTritonInferenceStage(config, model_name="cyber_log_pipeline", server_url=TRITON_URL, output_mapping=[ColumnInfo(name="label", dtype="int64"), ColumnInfo(name="is_security_event", dtype="int64"), ColumnInfo(name="event_type", dtype="int64"), ColumnInfo(name="priority", dtype="int64")]))
-            pipeline.add_stage(DecodeTritonOutputsStage(config, triton_url=TRITON_URL)); pipeline.add_stage(EnforceConsistencyStage(config)); pipeline.add_stage(GPUFeatureMappingStage(config))
-            pipeline.add_stage(AccumulatorStage(config)); pipeline.add_stage(AsyncTrainingStage(config)); pipeline.add_stage(ManualInferenceStage(config)); pipeline.add_stage(PythonKafkaSink(config, bootstrap_servers=KAFKA_BROKER, output_topic=OUTPUT_TOPIC))
+            pipeline.add_stage(DecodeTritonOutputsStage(config, triton_url=TRITON_URL))
+            pipeline.add_stage(EnforceConsistencyStage(config))
+            pipeline.add_stage(GPUFeatureMappingStage(config))
+            
+            pipeline.add_stage(AsyncTrainingStage(config))
+            pipeline.add_stage(ManualInferenceStage(config))
+            pipeline.add_stage(PythonKafkaSink(config, bootstrap_servers=KAFKA_BROKER, output_topic=OUTPUT_TOPIC))
             logger.info("🚀 Morpheus DFP Inference Pipeline starting..."); PIPELINE_HEALTH["status"] = "running"; pipeline.run()
         except Exception as e: logger.critical(f"🛑 FATAL PIPELINE ERROR: {e}"); PIPELINE_HEALTH["status"] = "error"; pytime.sleep(10)
         except KeyboardInterrupt: break
