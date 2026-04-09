@@ -287,8 +287,9 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             data_matrix = train_data.values
             if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
-            model.register_buffer("saved_scales", torch.tensor(np.std(data_matrix, axis=0) + 0.05, dtype=torch.float32, device=device))
+            # model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
+            # INCREASED EPSILON (0.15): Prevents low-variance features from triggering false 10.0 scores
+            model.register_buffer("saved_scales", torch.tensor(np.std(data_matrix, axis=0) + 0.15, dtype=torch.float32, device=device))
             if count == 1 or (count > 0 and count % self._save_interval == 0):
                 with MLFLOW_LOCK:
                     host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
@@ -403,22 +404,23 @@ class ManualInferenceStage(SinglePortStage):
                         reconstruction[mask] = normalized_input[mask]
             
             with torch.no_grad():
-                raw_errors = torch.abs(normalized_input - reconstruction)
-                max_val, max_indices = torch.max(raw_errors, dim=1)
-                loss_f32 = torch.mean(raw_errors, dim=1).to(torch.float32); reason_codes = max_indices.cpu().numpy()
-            scores_cpu = loss_f32.cpu().numpy(); batch_v = self.gpu_versions[stats_ids].cpu().numpy()
-            is_learning = (stats_ids == 0).cpu().numpy() | (batch_v < 5); scores_cpu[is_learning] = 0.0
-            def scale_score(s):
-                if s <= 0: return 0.0
-                if s <= 2.0: return s
-                return min(2.0 + np.log1p(s - 2.0) * 2.0, 10.0)
-            # 5. POST-PROCESSING (Scaling) - GPU VECTORIZED
+                abs_errors = torch.abs(normalized_input - reconstruction)
+                max_err, max_indices = torch.max(abs_errors, dim=1)
+                mean_err = torch.mean(abs_errors, dim=1)
+                
+                # BLENDED LOSS (0.7 MAE + 0.3 MAX): Captures both general drift and extreme spikes
+                loss_f32 = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
+                reason_codes = max_indices.cpu().numpy()
+            
             scores_cp = cp.asarray(loss_f32)
             is_learning_cp = cp.asarray(is_learning)
             
-            # Vectorized scaling: if s > 2.0: 2.0 + log1p(s-2.0)*2.0, else s
-            scaled_scores = cp.where(scores_cp <= 2.0, scores_cp, 2.0 + cp.log1p(cp.maximum(0, scores_cp - 2.0)) * 2.0)
-            scaled_scores = cp.where(scores_cp <= 0, 0.0, scaled_scores)
+            # REFINED SCALING: Smoother curve to prevent the 0.0 or 10.0 binary behavior
+            # Map score to 0-10 range with a sigmoid-like curve for better forensic detail
+            scaled_scores = cp.where(scores_cp <= 1.0, 
+                                     scores_cp * 2.5, # 0.0-1.0 maps to 0.0-2.5
+                                     2.5 + cp.log1p(scores_cp - 1.0) * 2.5) # log-scale above 2.5
+            
             scaled_scores = cp.where(is_learning_cp, 0.0, cp.clip(scaled_scores, 0.0, 10.0))
             
             # 6. REASON MAPPING - STAY ON GPU
@@ -429,7 +431,7 @@ class ManualInferenceStage(SinglePortStage):
             
             # Update results directly in cuDF (Zero-Copy)
             big_df["anomaly_score"] = scaled_scores
-            big_df["mean_abs_err"] = scores_cp
+            big_df["mean_abs_err"] = cp.asarray(mean_err)
             
             # Vectorized reason mapping using cuDF
             reason_series = cudf.Series(reason_codes)
