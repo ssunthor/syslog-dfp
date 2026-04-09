@@ -369,32 +369,38 @@ class ManualInferenceStage(SinglePortStage):
             
             reconstruction = torch.zeros_like(normalized_input)
             unique_ids = stats_ids.unique()
-            for sid in unique_ids:
-                sid_item = int(sid.item())
-                if sid_item == 0: continue
-                mask = (stats_ids == sid)
-                user_id = self.sources[sid_item]
-                with MODEL_CACHE_LOCK:
+            
+            # OPTIMIZATION: Take lock once per batch to gather all required models
+            # This significantly reduces overhead when a batch contains many unique hosts
+            models_to_run = {}
+            with MODEL_CACHE_LOCK:
+                for sid in unique_ids:
+                    sid_item = int(sid.item())
+                    if sid_item == 0: continue
+                    user_id = self.sources[sid_item]
                     model = GLOBAL_MODEL_CACHE.get(user_id)
-                if model:
-                    with torch.no_grad():
-                        try:
-                            if hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
-                                out = model.model(normalized_input[mask])
-                                if isinstance(out, tuple):
-                                    target_width = normalized_input[mask].shape[1]
-                                    for o in out:
-                                        if hasattr(o, "shape") and len(o.shape) > 1 and o.shape[1] == target_width:
-                                            reconstruction[mask] = o
-                                            break
-                                else:
-                                    reconstruction[mask] = out
-                            elif hasattr(model, "reconstruct"):
-                                reconstruction[mask] = model.reconstruct(normalized_input[mask])
+                    if model: models_to_run[sid_item] = model
+            
+            for sid_item, model in models_to_run.items():
+                mask = (stats_ids == sid_item)
+                with torch.no_grad():
+                    try:
+                        if hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
+                            out = model.model(normalized_input[mask])
+                            if isinstance(out, tuple):
+                                target_width = normalized_input[mask].shape[1]
+                                for o in out:
+                                    if hasattr(o, "shape") and len(o.shape) > 1 and o.shape[1] == target_width:
+                                        reconstruction[mask] = o
+                                        break
                             else:
-                                reconstruction[mask] = model(normalized_input[mask])
-                        except Exception:
-                            reconstruction[mask] = normalized_input[mask]
+                                reconstruction[mask] = out
+                        elif hasattr(model, "reconstruct"):
+                            reconstruction[mask] = model.reconstruct(normalized_input[mask])
+                        else:
+                            reconstruction[mask] = model(normalized_input[mask])
+                    except Exception:
+                        reconstruction[mask] = normalized_input[mask]
             
             with torch.no_grad():
                 raw_errors = torch.abs(normalized_input - reconstruction)
