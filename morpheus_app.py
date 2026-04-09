@@ -412,6 +412,10 @@ class ManualInferenceStage(SinglePortStage):
                 loss_f32 = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
                 reason_codes = max_indices.cpu().numpy()
             
+            # DEFINE LEARNING STATE: Host is new or model is too immature (less than 5 training cycles)
+            batch_v = self.gpu_versions[stats_ids].cpu().numpy()
+            is_learning = (stats_ids == 0).cpu().numpy() | (batch_v < 5)
+            
             scores_cp = cp.asarray(loss_f32)
             is_learning_cp = cp.asarray(is_learning)
             
