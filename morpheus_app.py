@@ -515,12 +515,23 @@ class EnforceConsistencyStage(PassThruTypeMixin, SinglePortStage):
             return msg
         node = builder.make_node(self.unique_name, ops.map(enforce)); builder.make_edge(input_node, node); return node
 
-class StringTritonInferenceStage(TritonInferenceStage):
+class StringTritonInferenceStage(SinglePortStage):
     def __init__(self, c, model_name, server_url, output_mapping):
-        super().__init__(c, model_name=model_name, server_url=server_url, force_convert_inputs=True)
-        self.output_mapping = output_mapping; self._client = None; self._debug_counter = 0
+        super().__init__(c)
+        self._model_name = model_name
+        self._server_url = server_url
+        self.output_mapping = output_mapping
+        self._client = None
+        self._debug_counter = 0
+
+    @property
+    def name(self): return "string-triton-inference"
+    def accepted_types(self): return (ControlMessage,)
     def supports_cpp_node(self): return False
-    def _get_inference_worker(self, inf_queue): return self
+    def compute_schema(self, schema):
+        schema.output_schema.set_type(ControlMessage)
+        return schema
+    
     def _ensure_client(self):
         from tritonclient.grpc import InferenceServerClient
         if self._client is None:
@@ -534,24 +545,16 @@ class StringTritonInferenceStage(TritonInferenceStage):
                 return False
         try:
             is_live = self._client.is_server_live()
-            if not is_live:
-                logger.warning(f"⚠️ Triton server {self._server_url} is not live.")
             return is_live
-        except Exception as e:
-            logger.error(f"❌ Error checking Triton server liveness at {self._server_url}: {e}")
+        except Exception:
             self._client = None
             return False
-    def init(self): self._ensure_client()
-    def stop(self): 
-        if self._client: self._client.close(); self._client = None
-    def build_output_message(self, message): return message
-    def _convert_one_response(self, output_message, req, resp, offset): return output_message
-    def _split_batches(self, message, max_batch_size): return [message]
-    def process(self, batch, cb):
-        if batch is None: cb(batch); return
-        meta = batch.payload()
+
+    def _process(self, msg: ControlMessage):
+        if msg is None: return None
         if self._ensure_client():
             try:
+                meta = msg.payload()
                 with meta.mutable_dataframe() as df:
                     batch_size = len(df)
                     
@@ -588,9 +591,12 @@ class StringTritonInferenceStage(TritonInferenceStage):
                             df[f"feature_{out.name}"] = df[out.name].astype("float32")
             except Exception as e:
                 logger.error(f"❌ Triton inference failed: {e}")
-        else:
-            logger.error(f"❌ Skipping Triton inference because server {self._server_url} is unreachable.")
-        cb(batch); return
+        return msg
+
+    def _build_single(self, builder, input_node):
+        node = builder.make_node(self.unique_name, ops.map(self._process))
+        builder.make_edge(input_node, node)
+        return node
 
 def run_inference_pipeline():
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR, exist_ok=True)
