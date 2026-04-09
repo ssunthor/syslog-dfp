@@ -167,8 +167,10 @@ class AccumulatorStage(SinglePortStage):
     def __init__(self, c):
         super().__init__(c)
         self._buffer = []; self._count = 0; self._last_flush = pytime.time()
-        self.batch_size = 16384; self.max_latency = 1.0; self.max_buffer_size = 32768 
+        # Tune batching: Wait up to 2 seconds or 16k logs
+        self.batch_size = 16384; self.max_latency = 2.0; self.max_buffer_size = 32768 
         self._perf_last_time = pytime.time()
+        self._perf_window_count = 0
     @property
     def name(self): return "accumulator"
     def accepted_types(self): return (ControlMessage,)
@@ -177,13 +179,16 @@ class AccumulatorStage(SinglePortStage):
     def _process(self, msg: ControlMessage):
         if msg is None: return None
         PIPELINE_HEALTH["last_activity"] = pytime.time(); PIPELINE_HEALTH["is_running"] = True; PIPELINE_HEALTH["status"] = "processing"
-        gdf = msg.payload().df; self._buffer.append(gdf); self._count += len(gdf)
+        gdf = msg.payload().df; self._buffer.append(gdf); self._count += len(gdf); self._perf_window_count += len(gdf)
         now = pytime.time()
         if self._count < self.batch_size and (now - self._last_flush < self.max_latency) and self._count < self.max_buffer_size: return None 
         try:
             big_gdf = cudf.concat(self._buffer); self._buffer = []; self._count = 0; self._last_flush = now
             dt = now - self._perf_last_time
-            if dt >= 5.0: logger.info(f"📊 ACCUMULATOR: Flush Size: {big_gdf.shape[0]} | EPS: {(big_gdf.shape[0])/dt:.1f}"); self._perf_last_time = now
+            if dt >= 5.0:
+                # Log the total windowed throughput to accurately reflect pod performance
+                logger.info(f"📊 ACCUMULATOR: Window EPS: {self._perf_window_count/dt:.1f} | Last Flush: {big_gdf.shape[0]}")
+                self._perf_last_time = now; self._perf_window_count = 0
             out = ControlMessage(); out.payload(MessageMeta(big_gdf)); return out
         except Exception as e: logger.error(f"Accumulator Flush Error: {e}"); self._buffer = []; self._count = 0; return None
     def _build_single(self, builder, input_node):
