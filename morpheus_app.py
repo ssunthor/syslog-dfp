@@ -248,9 +248,20 @@ class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
             try:
                 rows = len(df); duration_sec = max(float(rows) * 1000.0 / 1e9, 0.001)
                 counts = df['source'].value_counts()
-                df['feature_log_count'] = (df['source'].map(counts) / duration_sec * 60.0 / 2000.0).astype('float32')
-                for col in ["priority", "event_type", "is_security_event"]:
-                    df[f"feature_{col}"] = df[col].astype("float32") if col in df.columns else 0.0
+                
+                # OPTIMIZATION: Log-scaled volume (Prevents volume spikes from exploding the score)
+                eps = (df['source'].map(counts) / duration_sec * 60.0).astype('float32')
+                df['feature_log_count'] = cp.log1p(eps) / 10.0 # Normalized roughly for 0-20k EPS
+                
+                # Squashing discrete features to 0-1 range
+                if "priority" in df.columns:
+                    df["feature_priority"] = df["priority"].astype("float32") / 7.0
+                if "event_type" in df.columns:
+                    # Assuming max 100 event types, squash to 0-1
+                    df["feature_event_type"] = (df["event_type"].astype("float32") % 100) / 100.0
+                if "is_security_event" in df.columns:
+                    df["feature_is_security_event"] = df["is_security_event"].astype("float32")
+                
                 df["anomaly_score"] = -1.0; df["mean_abs_err"] = -1.0; df["anomaly_cause"] = "analysis_pending" 
             except Exception as e: logger.error(f"Preprocessing Late Error: {e}")
         return msg
@@ -287,9 +298,15 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             data_matrix = train_data.values
             if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            # model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
-            # INCREASED EPSILON (0.15): Prevents low-variance features from triggering false 10.0 scores
-            model.register_buffer("saved_scales", torch.tensor(np.std(data_matrix, axis=0) + 0.15, dtype=torch.float32, device=device))
+            
+            # ROBUST NORMALIZATION: Enforce a floor of 1.0 for standard deviation
+            # This ensures that a single discrete change (e.g. 0 -> 1) is treated as a 1.0 sigma event
+            # rather than a 10,000.0 sigma event.
+            stds = np.std(data_matrix, axis=0)
+            robust_stds = np.maximum(stds, 1.0)
+            
+            model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
+            model.register_buffer("saved_scales", torch.tensor(robust_stds, dtype=torch.float32, device=device))
             if count == 1 or (count > 0 and count % self._save_interval == 0):
                 with MLFLOW_LOCK:
                     host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
@@ -419,11 +436,27 @@ class ManualInferenceStage(SinglePortStage):
             scores_cp = cp.asarray(loss_f32)
             is_learning_cp = cp.asarray(is_learning)
             
+            # DIAGNOSTIC LOGGING (Throttled): See why scores are hitting 0 or 10
+            if len(big_df) > 0 and self._debug_counter % 50 == 0:
+                avg_raw_loss = float(cp.mean(scores_cp))
+                max_raw_loss = float(cp.max(scores_cp))
+                learning_count = int(cp.sum(is_learning_cp))
+                logger.info(f"🔬 SCORING DIAG: Batch={len(big_df)} | RawLoss (Avg={avg_raw_loss:.3f}, Max={max_raw_loss:.3f}) | Learning={learning_count}")
+                if not is_learning_cp.all():
+                    # Sample a non-learning row
+                    idx = int(cp.where(~is_learning_cp)[0][0])
+                    sample_raw = float(scores_cp[idx])
+                    sample_mean = float(mean_err[idx])
+                    sample_max = float(max_err[idx])
+                    sample_feat = FEATURE_COLS[int(reason_codes[idx])]
+                    logger.info(f"   Sample Row {idx}: Raw={sample_raw:.3f} (MAE={sample_mean:.3f}, Max={sample_max:.3f} on {sample_feat})")
+            self._debug_counter += 1
+            
             # REFINED SCALING: Smoother curve to prevent the 0.0 or 10.0 binary behavior
             # Map score to 0-10 range with a sigmoid-like curve for better forensic detail
             scaled_scores = cp.where(scores_cp <= 1.0, 
                                      scores_cp * 2.5, # 0.0-1.0 maps to 0.0-2.5
-                                     2.5 + cp.log1p(scores_cp - 1.0) * 2.5) # log-scale above 2.5
+                                     2.5 + cp.log1p(cp.maximum(0, scores_cp - 1.0)) * 2.5) # log-scale above 2.5
             
             scaled_scores = cp.where(is_learning_cp, 0.0, cp.clip(scaled_scores, 0.0, 10.0))
             
