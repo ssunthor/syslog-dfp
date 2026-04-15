@@ -299,11 +299,10 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
             device = "cuda" if torch.cuda.is_available() else "cpu"
             
-            # ROBUST NORMALIZATION: Enforce a floor of 1.0 for standard deviation
-            # This ensures that a single discrete change (e.g. 0 -> 1) is treated as a 1.0 sigma event
-            # rather than a 10,000.0 sigma event.
+            # ROBUST NORMALIZATION: Enforce a floor of 2.0 for standard deviation
+            # This prevents hypersensitive models from pegging at 10.0 for minor changes
             stds = np.std(data_matrix, axis=0)
-            robust_stds = np.maximum(stds, 1.0)
+            robust_stds = np.maximum(stds, 2.0)
             
             model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
             model.register_buffer("saved_scales", torch.tensor(robust_stds, dtype=torch.float32, device=device))
@@ -454,9 +453,12 @@ class ManualInferenceStage(SinglePortStage):
             
             # REFINED SCALING: Smoother curve to prevent the 0.0 or 10.0 binary behavior
             # Map score to 0-10 range with a sigmoid-like curve for better forensic detail
-            scaled_scores = cp.where(scores_cp <= 1.0, 
-                                     scores_cp * 2.5, # 0.0-1.0 maps to 0.0-2.5
-                                     2.5 + cp.log1p(cp.maximum(0, scores_cp - 1.0)) * 2.5) # log-scale above 2.5
+            # RawLoss of 1.0 (1 std floor) -> ~2.0
+            # RawLoss of 5.0 (5 std floor) -> ~5.5
+            # RawLoss of 20.0 (20 std floor) -> ~9.0
+            scaled_scores = cp.where(scores_cp <= 1.5, 
+                                     scores_cp * 2.0, # 0.0-1.5 maps to 0.0-3.0
+                                     3.0 + cp.log1p(cp.maximum(0, scores_cp - 1.5)) * 2.0) # smoother log growth
             
             scaled_scores = cp.where(is_learning_cp, 0.0, cp.clip(scaled_scores, 0.0, 10.0))
             
