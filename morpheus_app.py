@@ -100,6 +100,9 @@ logging.getLogger("morpheus.models.dfencoder").setLevel(logging.CRITICAL)
 
 MLFLOW_LOCK = threading.Lock()
 MODEL_DIR = "/app/models/dfp-models"
+FEEDBACK_DIR = os.path.join(MODEL_DIR, "feedback")
+if not os.path.exists(FEEDBACK_DIR): os.makedirs(FEEDBACK_DIR, exist_ok=True)
+
 TRAINING_EXECUTOR = ThreadPoolExecutor(max_workers=4) 
 TRAINING_IN_PROGRESS = set()
 TRAINING_SET_LOCK = threading.Lock()
@@ -119,6 +122,62 @@ NUM_FEATURES = len(FEATURE_COLS)
 GLOBAL_MODEL_CACHE = {}
 GLOBAL_TRAIN_COUNTER = {}
 MODEL_CACHE_LOCK = threading.Lock()
+
+@app.post("/feedback")
+async def add_feedback(data: dict):
+    """
+    Receives feedback from the UI to mark a log entry as 'normal'.
+    Expected data: {"source": "host_id", "features": {"feature_log_v0": 0.1, ...}}
+    """
+    source = data.get("source")
+    features = data.get("features")
+    if not source or not features:
+        return {"status": "error", "message": "Missing source or features"}
+    
+    # Filter only relevant feature columns
+    filtered_features = {k: v for k, v in features.items() if k in FEATURE_COLS}
+    
+    feedback_path = os.path.join(FEEDBACK_DIR, f"{source}.json")
+    try:
+        current_feedback = []
+        if os.path.exists(feedback_path):
+            with open(feedback_path, "r") as f:
+                current_feedback = json.load(f)
+        
+        # Keep last 100 feedback samples
+        current_feedback.append(filtered_features)
+        current_feedback = current_feedback[-100:]
+        
+        with open(feedback_path, "w") as f:
+            json.dump(current_feedback, f)
+        
+        logger.info(f"📝 FEEDBACK: Received for {source}. Total overrides: {len(current_feedback)}")
+        
+        # Immediate Fine-tune if model is in cache
+        with MODEL_CACHE_LOCK:
+            model = GLOBAL_MODEL_CACHE.get(source)
+            if model:
+                def fine_tune():
+                    try:
+                        # Convert to DataFrame
+                        df = pd.DataFrame([filtered_features])
+                        # Upsample feedback to ensure it has immediate effect
+                        df = pd.concat([df] * 20, ignore_index=True)
+                        with TRAINING_LOCK:
+                            model.fit(df, epochs=1)
+                        
+                        # Signal reload so inference engine picks up the new weights
+                        MODEL_UPDATED_EVENT.set()
+                        logger.info(f"🎯 FINE-TUNE: Applied feedback immediately for {source}")
+                    except Exception as e:
+                        logger.error(f"Fine-tune error: {e}")
+                
+                TRAINING_EXECUTOR.submit(fine_tune)
+
+        return {"status": "success", "overrides": len(current_feedback)}
+    except Exception as e:
+        logger.error(f"Feedback storage error: {e}")
+        return {"status": "error", "message": str(e)}
 
 def warm_up_model_cache():
     if not os.path.exists(MODEL_DIR): return
@@ -280,6 +339,23 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
     def _train_and_save(self, pdf, user_id, count):
         try:
             train_data = pdf[FEATURE_COLS]
+            
+            # INCLUDE FEEDBACK: Merge saved user overrides into the training set
+            feedback_path = os.path.join(FEEDBACK_DIR, f"{user_id}.json")
+            if os.path.exists(feedback_path):
+                try:
+                    with open(feedback_path, "r") as f:
+                        feedback_list = json.load(f)
+                    if feedback_list:
+                        feedback_df = pd.DataFrame(feedback_list)
+                        # Upsample feedback so it carries weight in the full training batch
+                        # (repeating feedback 10x vs the thousand+ samples in pdf)
+                        feedback_upsampled = pd.concat([feedback_df] * 10, ignore_index=True)
+                        train_data = pd.concat([train_data, feedback_upsampled], ignore_index=True)
+                        logger.info(f"🧬 AUGMENTED: Added {len(feedback_list)} feedback samples (upsampled to {len(feedback_upsampled)}) to training for {user_id}")
+                except Exception as e:
+                    logger.error(f"Error loading feedback for {user_id}: {e}")
+
             with MODEL_CACHE_LOCK:
                 if user_id not in GLOBAL_MODEL_CACHE:
                     GLOBAL_MODEL_CACHE[user_id] = AutoEncoder(encoder_layers=[32, 16], decoder_layers=[16, 32], activation='relu', patience=None)

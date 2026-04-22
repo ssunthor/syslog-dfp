@@ -49,6 +49,11 @@ The application is designed for **extreme throughput** (thousands of events per 
 - Hosts are automatically identified and queued for training once they accumulate enough data.
 - Models are trained in the background and promoted to the live inference engine without stopping the pipeline.
 
+### 5. "This is Normal" Override (Online Fine-Tuning)
+- **Active Feedback Loop:** Implemented a `/feedback` API that allows the system to receive specific feature vectors from users to mark them as "normal".
+- **Immediate Nudging:** On feedback, the system performs a targeted background fine-tuning session (`model.fit`) using upsampled feedback data to immediately lower the reconstruction error for that specific message pattern.
+- **Persistent Adaptation:** Feedback samples are persisted to disk and automatically merged into all future regular training cycles, ensuring the model's baseline permanently adapts to user corrections.
+
 ---
 
 ## 🚀 Performance Optimizations

@@ -35,6 +35,36 @@ The system learns from a **19-dimensional feature vector** for every host. When 
 ### 4. Content & Pattern (Semantic Hashing)
 *   **Log Content Anomaly:** The system maintains 8 independent hashing features (`feature_log_v0` through `feature_log_v7`). These capture the "shape" and vocabulary of the log message itself. This allows the model to detect new types of logs or changes in log structure even if the username or process remains the same.
 
+### 5. "This is Normal" (User Feedback & Fine-Tuning)
+The system supports **Online Fine-Tuning** through user feedback. If a legitimate (but rare) activity is flagged as an anomaly, users can mark it as "normal."
+- **Immediate Nudging:** The specific host's model is immediately fine-tuned in the background with the user-provided sample.
+- **Dynamic Thresholding:** The model's internal representation of "normal" for that host is adjusted, causing subsequent similar logs to receive a low anomaly score.
+- **Long-term Adaptation:** Feedback samples are persisted and automatically merged into all future full training cycles for that host.
+
+---
+
+## 🔌 API Documentation
+
+The pipeline exposes a FastAPI management interface (default: `13005`) for health monitoring and user feedback.
+
+### `GET /health`
+Returns the current status of the pipeline, last activity timestamp, and overall system health.
+
+### `POST /feedback`
+Submits a "This is Normal" override for a specific log entry.
+- **Payload:**
+  ```json
+  {
+    "source": "host_id",
+    "features": {
+      "feature_log_v0": 0.123,
+      "feature_priority": 0.5,
+      ...
+    }
+  }
+  ```
+- **Action:** Triggers an immediate background fine-tuning of the host-specific AutoEncoder model and persists the feedback for future training cycles.
+
 ---
 
 ## 🛠 Technology Stack
