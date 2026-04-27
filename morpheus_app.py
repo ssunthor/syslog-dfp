@@ -154,12 +154,37 @@ def process_feedback_locally(source, features):
             if model:
                 def fine_tune():
                     try:
+                        # AGGRESSIVE NUDGE: Convert to DataFrame
                         df = pd.DataFrame([filtered_features])
-                        df = pd.concat([df] * 20, ignore_index=True)
+                        # Upsample feedback significantly to ensure it shifts the weights
+                        df_boosted = pd.concat([df] * 100, ignore_index=True)
+                        
                         with TRAINING_LOCK:
-                            model.fit(df, epochs=1)
+                            # Train for multiple epochs on the nudge data
+                            model.fit(df_boosted, epochs=3)
+                            
+                            # CRITICAL: We must also update the model's normalization buffers 
+                            # (saved_means/saved_scales) so the score actually drops.
+                            if hasattr(model, "saved_means"):
+                                device = "cuda" if torch.cuda.is_available() else "cpu"
+                                feedback_tensor = torch.as_tensor(df.values[0], dtype=torch.float32, device=device)
+                                
+                                # Mix in the new "normal" mean (20% weight to the nudge)
+                                current_means = model.saved_means
+                                new_means = (current_means * 0.8) + (feedback_tensor * 0.2)
+                                model.register_buffer("saved_means", new_means)
+                                
+                                # Also slightly widen the scales for the contributing features
+                                # to reduce sensitivity for this specific pattern
+                                current_scales = model.saved_scales
+                                new_scales = torch.maximum(current_scales, torch.abs(current_means - feedback_tensor) * 1.5)
+                                # Maintain the floor of 2.0
+                                new_scales = torch.maximum(new_scales, torch.tensor(2.0, device=device))
+                                model.register_buffer("saved_scales", new_scales)
+
+                        # Signal reload so inference engine picks up the new weights
                         MODEL_UPDATED_EVENT.set()
-                        logger.info(f"🎯 FINE-TUNE [Local]: Applied feedback immediately for {source}")
+                        logger.info(f"🎯 FINE-TUNE [Local]: Applied AGGRESSIVE nudge for {source}")
                     except Exception as e:
                         logger.error(f"Fine-tune error: {e}")
                 
