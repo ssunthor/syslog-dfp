@@ -123,7 +123,7 @@ GLOBAL_MODEL_CACHE = {}
 GLOBAL_TRAIN_COUNTER = {}
 MODEL_CACHE_LOCK = threading.Lock()
 
-CONTROL_TOPIC = os.getenv("CONTROL_TOPIC", "morpheus-control")
+CONTROL_TOPIC = os.getenv("KAFKA_CONTROL_TOPIC", "morpheus-control")
 
 def process_feedback_locally(source, features):
     """Internal logic to save feedback and fine-tune model if loaded."""
