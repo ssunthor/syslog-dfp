@@ -136,15 +136,24 @@ def process_feedback_locally(source, features):
     try:
         current_feedback = []
         if os.path.exists(feedback_path):
-            with open(feedback_path, "r") as f:
-                current_feedback = json.load(f)
+            try:
+                with open(feedback_path, "r") as f:
+                    current_feedback = json.load(f)
+                if not isinstance(current_feedback, list):
+                    current_feedback = []
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"⚠️ Corrupted feedback file for {source}, resetting: {e}")
+                current_feedback = []
         
         # Keep last 100 feedback samples
         current_feedback.append(filtered_features)
         current_feedback = current_feedback[-100:]
         
-        with open(feedback_path, "w") as f:
+        # ATOMIC WRITE: Write to temp file then move to prevent "two JSON strings" corruption
+        temp_path = feedback_path + ".tmp"
+        with open(temp_path, "w") as f:
             json.dump(current_feedback, f)
+        os.replace(temp_path, feedback_path)
         
         logger.info(f"📝 FEEDBACK [Local]: Processed for {source}. Total overrides: {len(current_feedback)}")
         
@@ -409,13 +418,15 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
                 try:
                     with open(feedback_path, "r") as f:
                         feedback_list = json.load(f)
-                    if feedback_list:
+                    if feedback_list and isinstance(feedback_list, list):
                         feedback_df = pd.DataFrame(feedback_list)
                         # Upsample feedback so it carries weight in the full training batch
                         # (repeating feedback 10x vs the thousand+ samples in pdf)
                         feedback_upsampled = pd.concat([feedback_df] * 10, ignore_index=True)
                         train_data = pd.concat([train_data, feedback_upsampled], ignore_index=True)
                         logger.info(f"🧬 AUGMENTED: Added {len(feedback_list)} feedback samples (upsampled to {len(feedback_upsampled)}) to training for {user_id}")
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"⚠️ Training: Skipping corrupted feedback for {user_id}: {e}")
                 except Exception as e:
                     logger.error(f"Error loading feedback for {user_id}: {e}")
 
