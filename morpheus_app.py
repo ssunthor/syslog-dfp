@@ -354,13 +354,19 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     df["feature_proc_hash"] = (procs.hash_values() % 1000).astype("float32") / 1000.0
                     for i in range(NUM_LOG_FEATURES): df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 1000).astype("float32") / 1000.0
                 else: df["source"] = "unknown_source"
-                now = datetime.utcnow(); hour = now.hour + now.minute / 60.0; day = now.weekday()
-                df["feature_hour_sin"] = float(np.sin(2 * np.pi * hour / 24.0))
-                df["feature_hour_cos"] = float(np.cos(2 * np.pi * hour / 24.0))
-                df["feature_day_sin"] = float(np.sin(2 * np.pi * day / 7.0))
-                df["feature_day_cos"] = float(np.cos(2 * np.pi * day / 7.0))
+
+                now = datetime.utcnow()
                 rows = len(df); time_offsets = cp.arange(rows, dtype='int64') * 1000 
                 df["timestamp"] = cudf.to_datetime(time_offsets + int(now.timestamp() * 1e9), unit="ns")
+
+                # Per-row time features (Vectorized on GPU)
+                hours = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
+                days = df["timestamp"].dt.weekday.astype("float32")
+                
+                df["feature_hour_sin"] = cp.sin(2 * np.pi * hours / 24.0).astype("float32")
+                df["feature_hour_cos"] = cp.cos(2 * np.pi * hours / 24.0).astype("float32")
+                df["feature_day_sin"] = cp.sin(2 * np.pi * days / 7.0).astype("float32")
+                df["feature_day_cos"] = cp.cos(2 * np.pi * days / 7.0).astype("float32")
             except Exception as e: logger.error(f"Preprocessing Early Error: {e}")
         return msg
     def _build_single(self, builder, input_node):
@@ -432,11 +438,29 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
 
             with MODEL_CACHE_LOCK:
                 if user_id not in GLOBAL_MODEL_CACHE:
-                    GLOBAL_MODEL_CACHE[user_id] = AutoEncoder(encoder_layers=[32, 16], decoder_layers=[16, 32], activation='relu', patience=None)
+                    # PROPER BOTTLENECK: [12, 8] for 19 features ensures useful compression
+                    GLOBAL_MODEL_CACHE[user_id] = AutoEncoder(encoder_layers=[12, 8], decoder_layers=[8, 12], activation='relu', patience=None)
                     if torch.cuda.is_available(): GLOBAL_MODEL_CACHE[user_id].to("cuda").float()
             model = GLOBAL_MODEL_CACHE.get(user_id)
             if not model: return
-            with TRAINING_LOCK: model.fit(train_data, epochs=1) 
+
+            # CALCULATE NORMALIZATION BEFORE TRAINING
+            data_matrix = train_data.values
+            if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            means = np.mean(data_matrix, axis=0)
+            stds = np.std(data_matrix, axis=0)
+            # SENSITIVE NORMALIZATION: Floor of 0.1 is more appropriate for 0-1 features
+            robust_stds = np.maximum(stds, 0.1)
+            
+            # Normalize the training data so model learns on scaled input (MATCHES INFERENCE)
+            # Using pandas broadcasting for consistency with FEATURE_COLS
+            normalized_train_data = (train_data - means) / robust_stds
+            
+            with TRAINING_LOCK: 
+                # Train for 3 epochs for better convergence
+                model.fit(normalized_train_data, epochs=3) 
             
             # SYNC: Update global counter so inference engine knows we have progressed
             with MODEL_CACHE_LOCK:
@@ -445,17 +469,10 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             # SIGNAL: Notify inference engine that metadata (version/means) has changed
             MODEL_UPDATED_EVENT.set()
 
-            data_matrix = train_data.values
-            if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            # ROBUST NORMALIZATION: Enforce a floor of 2.0 for standard deviation
-            # This prevents hypersensitive models from pegging at 10.0 for minor changes
-            stds = np.std(data_matrix, axis=0)
-            robust_stds = np.maximum(stds, 2.0)
-            
-            model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
+            # Update Buffers
+            model.register_buffer("saved_means", torch.tensor(means, dtype=torch.float32, device=device))
             model.register_buffer("saved_scales", torch.tensor(robust_stds, dtype=torch.float32, device=device))
+            
             if count == 1 or (count > 0 and count % self._save_interval == 0):
                 with MLFLOW_LOCK:
                     host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
