@@ -43,6 +43,20 @@ The system supports **Online Fine-Tuning** through user feedback. If a legitimat
 
 ---
 
+## 📊 Scoring Breakdown
+
+Anomaly scores range from **0.0 to 10.0**, representing the "Reconstruction Error" (how surprised the AI is by the current event compared to that host's unique historical baseline).
+
+| Score Range | Severity | Interpretation | Recommended Action |
+| :--- | :--- | :--- | :--- |
+| **0.0** | ⚪ **Learning** | Host is new or profiling is immature (seen < 5 training cycles). | Wait for profiling to complete. |
+| **0.1 - 2.0** | 🟢 **Normal** | Expected behavior; matches the learned profile perfectly. | Ignore. |
+| **2.1 - 4.0** | 🟡 **Concern** | Minor drift; unusual volume or timing but not necessarily malicious. | Monitor for progression. |
+| **4.1 - 7.5** | 🟠 **Anomaly** | Significant deviation; new user, process, or massive volume spike. | Investigate in Event Inspector. |
+| **7.6 - 10.0** | 🔴 **Critical** | Radically different behavior; multiple features deviating simultaneously. | Immediate Incident Response. |
+
+---
+
 ## 🔌 API Documentation
 
 The pipeline exposes a FastAPI management interface (default: `13005`) for health monitoring and user feedback.
