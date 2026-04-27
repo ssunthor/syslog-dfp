@@ -18,7 +18,7 @@ import json
 import psutil
 from datetime import datetime, timedelta
 import rmm
-from confluent_kafka import Producer
+from confluent_kafka import Producer, Consumer, KafkaError
 
 # --- CUDA / ML ---
 import cudf
@@ -118,21 +118,16 @@ for i in range(NUM_LOG_FEATURES):
     FEATURE_COLS.append(f"feature_log_v{i}")
 NUM_FEATURES = len(FEATURE_COLS)
 
-# Global Cache to share between stages
+# Shared model cache between training and inference
 GLOBAL_MODEL_CACHE = {}
 GLOBAL_TRAIN_COUNTER = {}
 MODEL_CACHE_LOCK = threading.Lock()
 
-@app.post("/feedback")
-async def add_feedback(data: dict):
-    """
-    Receives feedback from the UI to mark a log entry as 'normal'.
-    Expected data: {"source": "host_id", "features": {"feature_log_v0": 0.1, ...}}
-    """
-    source = data.get("source")
-    features = data.get("features")
-    if not source or not features:
-        return {"status": "error", "message": "Missing source or features"}
+CONTROL_TOPIC = os.getenv("CONTROL_TOPIC", "morpheus-control")
+
+def process_feedback_locally(source, features):
+    """Internal logic to save feedback and fine-tune model if loaded."""
+    if not source or not features: return None
     
     # Filter only relevant feature columns
     filtered_features = {k: v for k, v in features.items() if k in FEATURE_COLS}
@@ -151,7 +146,7 @@ async def add_feedback(data: dict):
         with open(feedback_path, "w") as f:
             json.dump(current_feedback, f)
         
-        logger.info(f"📝 FEEDBACK: Received for {source}. Total overrides: {len(current_feedback)}")
+        logger.info(f"📝 FEEDBACK [Local]: Processed for {source}. Total overrides: {len(current_feedback)}")
         
         # Immediate Fine-tune if model is in cache
         with MODEL_CACHE_LOCK:
@@ -159,25 +154,68 @@ async def add_feedback(data: dict):
             if model:
                 def fine_tune():
                     try:
-                        # Convert to DataFrame
                         df = pd.DataFrame([filtered_features])
-                        # Upsample feedback to ensure it has immediate effect
                         df = pd.concat([df] * 20, ignore_index=True)
                         with TRAINING_LOCK:
                             model.fit(df, epochs=1)
-                        
-                        # Signal reload so inference engine picks up the new weights
                         MODEL_UPDATED_EVENT.set()
-                        logger.info(f"🎯 FINE-TUNE: Applied feedback immediately for {source}")
+                        logger.info(f"🎯 FINE-TUNE [Local]: Applied feedback immediately for {source}")
                     except Exception as e:
                         logger.error(f"Fine-tune error: {e}")
                 
                 TRAINING_EXECUTOR.submit(fine_tune)
-
-        return {"status": "success", "overrides": len(current_feedback)}
+        return len(current_feedback)
     except Exception as e:
-        logger.error(f"Feedback storage error: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Local feedback processing error: {e}")
+        return None
+
+def control_worker():
+    """Background thread to listen for control messages (Feedback) from Kafka."""
+    broker = os.getenv("KAFKA_BROKER", "localhost:9092")
+    # EVERY pod needs a unique group ID to ensure they all get the broadcast
+    pod_id = f"morpheus-control-{uuid.uuid4().hex[:8]}"
+    
+    conf = {
+        'bootstrap.servers': broker,
+        'group.id': pod_id,
+        'auto.offset.reset': 'latest'
+    }
+    
+    consumer = Consumer(conf)
+    consumer.subscribe([CONTROL_TOPIC])
+    
+    logger.info(f"📡 Control Worker started. Subscribed to {CONTROL_TOPIC} (Group: {pod_id})")
+    
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None: continue
+        if msg.error():
+            if msg.error().code() != KafkaError._PARTITION_EOF:
+                logger.error(f"Control Kafka Error: {msg.error()}")
+            continue
+            
+        try:
+            data = json.loads(msg.value().decode('utf-8'))
+            if data.get("type") == "feedback":
+                source = data.get("source")
+                features = data.get("features")
+                logger.info(f"📩 Received Broadcast Feedback for {source}")
+                process_feedback_locally(source, features)
+        except Exception as e:
+            logger.error(f"Control message processing error: {e}")
+
+@app.post("/feedback")
+async def add_feedback(data: dict):
+    """
+    Receives feedback from the UI to mark a log entry as 'normal'.
+    (Kept for backward compatibility, but backend now broadcasts via Kafka)
+    """
+    source = data.get("source")
+    features = data.get("features")
+    overrides = process_feedback_locally(source, features)
+    if overrides is not None:
+        return {"status": "success", "overrides": overrides}
+    return {"status": "error", "message": "Failed to process feedback"}
 
 def warm_up_model_cache():
     if not os.path.exists(MODEL_DIR): return
@@ -729,7 +767,10 @@ class StringTritonInferenceStage(SinglePortStage):
 def run_inference_pipeline():
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR, exist_ok=True)
     os.environ["MLFLOW_TRACKING_URI"] = f"file://{MODEL_DIR}"
-    warm_up_model_cache(); threading.Thread(target=memory_manager_worker, daemon=True).start(); threading.Thread(target=run_health_server, daemon=True).start()
+    warm_up_model_cache()
+    threading.Thread(target=memory_manager_worker, daemon=True).start()
+    threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=control_worker, daemon=True).start()
     while True:
         try:
             config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = 32768; config.edge_buffer_size = 32768; config.mode = "AE"; config.num_threads = 8
