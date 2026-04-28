@@ -447,7 +447,7 @@ class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
 class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
     def __init__(self, c):
         super().__init__(c); self._train_counter = {}; self._last_train_time = {} 
-        self._save_interval = 20; self._queue_semaphore = threading.Semaphore(64) 
+        self._save_interval = 50; self._queue_semaphore = threading.Semaphore(64) 
     @property
     def name(self): return "async-training"
     def accepted_types(self): return (ControlMessage,)
@@ -546,7 +546,11 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             with TRAINING_SET_LOCK:
                 if user_id in TRAINING_IN_PROGRESS: continue
             if not self._queue_semaphore.acquire(blocking=False): continue
-            with MODEL_CACHE_LOCK: self._train_counter[user_id] = max(self._train_counter.get(user_id, 0), GLOBAL_TRAIN_COUNTER.get(user_id, 0)) + 1
+            
+            # Per-host versioning: increment from last known version for this specific host
+            with MODEL_CACHE_LOCK: 
+                self._train_counter[user_id] = self._train_counter.get(user_id, GLOBAL_TRAIN_COUNTER.get(user_id, 0)) + 1
+            
             count = self._train_counter[user_id]; logger.info(f"⚡ TRAINING START: Host {user_id} ({counts[user_id]}) - V{count}")
             self._last_train_time[user_id] = pytime.time()
             with TRAINING_SET_LOCK: 
