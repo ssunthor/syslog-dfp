@@ -255,30 +255,37 @@ def warm_up_model_cache():
     if not os.path.exists(MODEL_DIR): return
     logger.info(f"🕵️ WARMING UP: Scanning {MODEL_DIR} for existing models...")
     count = 0
-    dirs_to_check = [MODEL_DIR, os.path.join(MODEL_DIR, "models")]
-    for base_dir in dirs_to_check:
-        if not os.path.exists(base_dir): continue
-        try:
-            for host_dir_name in os.listdir(base_dir):
-                if not host_dir_name.startswith("dfp-"): continue
-                user_id = host_dir_name.replace("dfp-", "")
-                if user_id in GLOBAL_MODEL_CACHE: continue
-                host_path = os.path.join(base_dir, host_dir_name)
-                try:
-                    versions = [v for v in os.listdir(host_path) if v.startswith("version-")]
-                    if not versions: continue
-                    latest_v_str = sorted(versions, key=lambda x: int(x.split('-')[1]))[-1]
-                    latest_v_num = int(latest_v_str.split('-')[1])
-                    model_path = os.path.join(host_path, latest_v_str, "model")
-                    if os.path.exists(model_path):
-                        with MLFLOW_LOCK:
-                            loaded = mlflow.pytorch.load_model(model_path)
-                            if torch.cuda.is_available(): loaded.to("cuda").float()
-                            GLOBAL_MODEL_CACHE[user_id] = loaded
-                            GLOBAL_TRAIN_COUNTER[user_id] = latest_v_num
-                            count += 1
-                except: pass
-        except: pass
+    try:
+        for host_dir_name in os.listdir(MODEL_DIR):
+            if not host_dir_name.startswith("dfp-"): continue
+            user_id = host_dir_name.replace("dfp-", "")
+            if user_id in GLOBAL_MODEL_CACHE: continue
+            
+            host_path = os.path.join(MODEL_DIR, host_dir_name)
+            try:
+                # Look for model-v*.pt files
+                model_files = [f for f in os.listdir(host_path) if f.startswith("model-v") and f.endswith(".pt")]
+                if not model_files: continue
+                
+                # Get latest version
+                latest_model_file = sorted(model_files, key=lambda x: int(x.split('-v')[1].split('.')[0]))[-1]
+                latest_v_num = int(latest_model_file.split('-v')[1].split('.')[0])
+                model_path = os.path.join(host_path, latest_model_file)
+                
+                if os.path.exists(model_path):
+                    # Use raw torch.load instead of mlflow
+                    loaded = torch.load(model_path)
+                    if torch.cuda.is_available(): 
+                        loaded.to("cuda").float()
+                    
+                    GLOBAL_MODEL_CACHE[user_id] = loaded
+                    GLOBAL_TRAIN_COUNTER[user_id] = latest_v_num
+                    count += 1
+            except Exception as e:
+                logger.warning(f"Error loading model for {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Warm up error: {e}")
+    
     logger.info(f"🚀 WARM UP COMPLETE: Loaded {count} models into memory.")
 
 def memory_manager_worker():
@@ -290,6 +297,37 @@ def memory_manager_worker():
                 cp.get_default_memory_pool().free_all_blocks()
             pytime.sleep(10)
         except: pytime.sleep(30)
+
+def model_janitor_worker():
+    """Deletes models for hosts that haven't been seen in 48 hours to save disk space."""
+    TTL_SECONDS = 48 * 3600
+    while True:
+        try:
+            if os.path.exists(MODEL_DIR):
+                now = pytime.time()
+                for host_dir_name in os.listdir(MODEL_DIR):
+                    if not host_dir_name.startswith("dfp-"): continue
+                    host_path = os.path.join(MODEL_DIR, host_dir_name)
+                    
+                    # Check the mtime of the directory or the model file
+                    mtime = os.path.getmtime(host_path)
+                    if (now - mtime) > TTL_SECONDS:
+                        logger.info(f"🧹 JANITOR: Pruning stale host model: {host_dir_name} (Last seen > 48h ago)")
+                        shutil.rmtree(host_path)
+                        
+                        # Also remove from memory cache if present
+                        user_id = host_dir_name.replace("dfp-", "")
+                        with MODEL_CACHE_LOCK:
+                            if user_id in GLOBAL_MODEL_CACHE:
+                                del GLOBAL_MODEL_CACHE[user_id]
+                                if user_id in GLOBAL_TRAIN_COUNTER:
+                                    del GLOBAL_TRAIN_COUNTER[user_id]
+            
+            # Run every 6 hours
+            pytime.sleep(6 * 3600)
+        except Exception as e:
+            logger.error(f"Janitor error: {e}")
+            pytime.sleep(3600)
 
 # --- STAGES ---
 
@@ -474,13 +512,23 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             model.register_buffer("saved_scales", torch.tensor(robust_stds, dtype=torch.float32, device=device))
             
             if count == 1 or (count > 0 and count % self._save_interval == 0):
-                with MLFLOW_LOCK:
-                    host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
-                    if count == 1: shutil.rmtree(host_dir, ignore_errors=True)
-                    version_dir = os.path.join(host_dir, f"version-{count}"); model_save_path = os.path.join(version_dir, "model")
-                    os.makedirs(version_dir, exist_ok=True)
-                    mlflow.pytorch.save_model(model, path=model_save_path, pip_requirements=["torch", "mlflow", "pandas"])
-                    MODEL_UPDATED_EVENT.set(); logger.info(f"💾 SAVED: Host {user_id} Version {count}")
+                host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
+                if count == 1: shutil.rmtree(host_dir, ignore_errors=True)
+                os.makedirs(host_dir, exist_ok=True)
+                
+                # LIGHTWEIGHT SAVE: (~200KB vs ~15MB MLflow overhead)
+                model_save_path = os.path.join(host_dir, f"model-v{count}.pt")
+                torch.save(model, model_save_path)
+                
+                # VERSION PRUNING: Only keep the latest version on disk
+                try:
+                    for f in os.listdir(host_dir):
+                        if f.startswith("model-v") and f != f"model-v{count}.pt":
+                            os.remove(os.path.join(host_dir, f))
+                except Exception as e:
+                    logger.warning(f"Version pruning error for {user_id}: {e}")
+                
+                MODEL_UPDATED_EVENT.set(); logger.info(f"💾 SAVED: Host {user_id} Version {count} (Lightweight)")
         except Exception as e: logger.error(f"❌ Training Thread Error for {user_id}: {e}")
         finally:
              self._queue_semaphore.release()
@@ -822,6 +870,7 @@ def run_inference_pipeline():
     os.environ["MLFLOW_TRACKING_URI"] = f"file://{MODEL_DIR}"
     warm_up_model_cache()
     threading.Thread(target=memory_manager_worker, daemon=True).start()
+    threading.Thread(target=model_janitor_worker, daemon=True).start()
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=control_worker, daemon=True).start()
     while True:
