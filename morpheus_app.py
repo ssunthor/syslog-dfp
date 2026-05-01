@@ -18,7 +18,7 @@ import json
 import psutil
 from datetime import datetime, timedelta
 import rmm
-from confluent_kafka import Producer
+from confluent_kafka import Producer, Consumer, KafkaError
 
 # --- CUDA / ML ---
 import cudf
@@ -100,6 +100,9 @@ logging.getLogger("morpheus.models.dfencoder").setLevel(logging.CRITICAL)
 
 MLFLOW_LOCK = threading.Lock()
 MODEL_DIR = "/app/models/dfp-models"
+FEEDBACK_DIR = os.path.join(MODEL_DIR, "feedback")
+if not os.path.exists(FEEDBACK_DIR): os.makedirs(FEEDBACK_DIR, exist_ok=True)
+
 TRAINING_EXECUTOR = ThreadPoolExecutor(max_workers=4) 
 TRAINING_IN_PROGRESS = set()
 TRAINING_SET_LOCK = threading.Lock()
@@ -115,39 +118,174 @@ for i in range(NUM_LOG_FEATURES):
     FEATURE_COLS.append(f"feature_log_v{i}")
 NUM_FEATURES = len(FEATURE_COLS)
 
-# Global Cache to share between stages
+# Shared model cache between training and inference
 GLOBAL_MODEL_CACHE = {}
 GLOBAL_TRAIN_COUNTER = {}
 MODEL_CACHE_LOCK = threading.Lock()
+
+CONTROL_TOPIC = os.getenv("KAFKA_CONTROL_TOPIC", "morpheus-control")
+
+def process_feedback_locally(source, features):
+    """Internal logic to save feedback and fine-tune model if loaded."""
+    if not source or not features: return None
+    
+    # Filter only relevant feature columns
+    filtered_features = {k: v for k, v in features.items() if k in FEATURE_COLS}
+    
+    feedback_path = os.path.join(FEEDBACK_DIR, f"{source}.json")
+    try:
+        current_feedback = []
+        if os.path.exists(feedback_path):
+            try:
+                with open(feedback_path, "r") as f:
+                    current_feedback = json.load(f)
+                if not isinstance(current_feedback, list):
+                    current_feedback = []
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"⚠️ Corrupted feedback file for {source}, resetting: {e}")
+                current_feedback = []
+        
+        # Keep last 100 feedback samples
+        current_feedback.append(filtered_features)
+        current_feedback = current_feedback[-100:]
+        
+        # ATOMIC WRITE: Write to temp file then move to prevent "two JSON strings" corruption
+        temp_path = feedback_path + ".tmp"
+        with open(temp_path, "w") as f:
+            json.dump(current_feedback, f)
+        os.replace(temp_path, feedback_path)
+        
+        logger.info(f"📝 FEEDBACK [Local]: Processed for {source}. Total overrides: {len(current_feedback)}")
+        
+        # Immediate Fine-tune if model is in cache
+        with MODEL_CACHE_LOCK:
+            model = GLOBAL_MODEL_CACHE.get(source)
+            if model:
+                def fine_tune():
+                    try:
+                        # AGGRESSIVE NUDGE: Convert to DataFrame
+                        df = pd.DataFrame([filtered_features])
+                        # Upsample feedback significantly to ensure it shifts the weights
+                        df_boosted = pd.concat([df] * 100, ignore_index=True)
+                        
+                        with TRAINING_LOCK:
+                            # Train for multiple epochs on the nudge data
+                            model.fit(df_boosted, epochs=3)
+                            
+                            # CRITICAL: We must also update the model's normalization buffers 
+                            # (saved_means/saved_scales) so the score actually drops.
+                            if hasattr(model, "saved_means"):
+                                device = "cuda" if torch.cuda.is_available() else "cpu"
+                                feedback_tensor = torch.as_tensor(df.values[0], dtype=torch.float32, device=device)
+                                
+                                # Mix in the new "normal" mean (20% weight to the nudge)
+                                current_means = model.saved_means
+                                new_means = (current_means * 0.8) + (feedback_tensor * 0.2)
+                                model.register_buffer("saved_means", new_means)
+                                
+                                # Also slightly widen the scales for the contributing features
+                                # to reduce sensitivity for this specific pattern
+                                current_scales = model.saved_scales
+                                new_scales = torch.maximum(current_scales, torch.abs(current_means - feedback_tensor) * 1.5)
+                                # Maintain the floor of 2.0
+                                new_scales = torch.maximum(new_scales, torch.tensor(2.0, device=device))
+                                model.register_buffer("saved_scales", new_scales)
+
+                        # Signal reload so inference engine picks up the new weights
+                        MODEL_UPDATED_EVENT.set()
+                        logger.info(f"🎯 FINE-TUNE [Local]: Applied AGGRESSIVE nudge for {source}")
+                    except Exception as e:
+                        logger.error(f"Fine-tune error: {e}")
+                
+                TRAINING_EXECUTOR.submit(fine_tune)
+        return len(current_feedback)
+    except Exception as e:
+        logger.error(f"Local feedback processing error: {e}")
+        return None
+
+def control_worker():
+    """Background thread to listen for control messages (Feedback) from Kafka."""
+    broker = os.getenv("KAFKA_BROKER", "localhost:9092")
+    # EVERY pod needs a unique group ID to ensure they all get the broadcast
+    pod_id = f"morpheus-control-{uuid.uuid4().hex[:8]}"
+    
+    conf = {
+        'bootstrap.servers': broker,
+        'group.id': pod_id,
+        'auto.offset.reset': 'latest'
+    }
+    
+    consumer = Consumer(conf)
+    consumer.subscribe([CONTROL_TOPIC])
+    
+    logger.info(f"📡 Control Worker started. Subscribed to {CONTROL_TOPIC} (Group: {pod_id})")
+    
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None: continue
+        if msg.error():
+            if msg.error().code() != KafkaError._PARTITION_EOF:
+                logger.error(f"Control Kafka Error: {msg.error()}")
+            continue
+            
+        try:
+            data = json.loads(msg.value().decode('utf-8'))
+            if data.get("type") == "feedback":
+                source = data.get("source")
+                features = data.get("features")
+                logger.info(f"📩 Received Broadcast Feedback for {source}")
+                process_feedback_locally(source, features)
+        except Exception as e:
+            logger.error(f"Control message processing error: {e}")
+
+@app.post("/feedback")
+async def add_feedback(data: dict):
+    """
+    Receives feedback from the UI to mark a log entry as 'normal'.
+    (Kept for backward compatibility, but backend now broadcasts via Kafka)
+    """
+    source = data.get("source")
+    features = data.get("features")
+    overrides = process_feedback_locally(source, features)
+    if overrides is not None:
+        return {"status": "success", "overrides": overrides}
+    return {"status": "error", "message": "Failed to process feedback"}
 
 def warm_up_model_cache():
     if not os.path.exists(MODEL_DIR): return
     logger.info(f"🕵️ WARMING UP: Scanning {MODEL_DIR} for existing models...")
     count = 0
-    dirs_to_check = [MODEL_DIR, os.path.join(MODEL_DIR, "models")]
-    for base_dir in dirs_to_check:
-        if not os.path.exists(base_dir): continue
-        try:
-            for host_dir_name in os.listdir(base_dir):
-                if not host_dir_name.startswith("dfp-"): continue
-                user_id = host_dir_name.replace("dfp-", "")
-                if user_id in GLOBAL_MODEL_CACHE: continue
-                host_path = os.path.join(base_dir, host_dir_name)
-                try:
-                    versions = [v for v in os.listdir(host_path) if v.startswith("version-")]
-                    if not versions: continue
-                    latest_v_str = sorted(versions, key=lambda x: int(x.split('-')[1]))[-1]
-                    latest_v_num = int(latest_v_str.split('-')[1])
-                    model_path = os.path.join(host_path, latest_v_str, "model")
-                    if os.path.exists(model_path):
-                        with MLFLOW_LOCK:
-                            loaded = mlflow.pytorch.load_model(model_path)
-                            if torch.cuda.is_available(): loaded.to("cuda").float()
-                            GLOBAL_MODEL_CACHE[user_id] = loaded
-                            GLOBAL_TRAIN_COUNTER[user_id] = latest_v_num
-                            count += 1
-                except: pass
-        except: pass
+    try:
+        for host_dir_name in os.listdir(MODEL_DIR):
+            if not host_dir_name.startswith("dfp-"): continue
+            user_id = host_dir_name.replace("dfp-", "")
+            if user_id in GLOBAL_MODEL_CACHE: continue
+            
+            host_path = os.path.join(MODEL_DIR, host_dir_name)
+            try:
+                # Look for model-v*.pt files
+                model_files = [f for f in os.listdir(host_path) if f.startswith("model-v") and f.endswith(".pt")]
+                if not model_files: continue
+                
+                # Get latest version
+                latest_model_file = sorted(model_files, key=lambda x: int(x.split('-v')[1].split('.')[0]))[-1]
+                latest_v_num = int(latest_model_file.split('-v')[1].split('.')[0])
+                model_path = os.path.join(host_path, latest_model_file)
+                
+                if os.path.exists(model_path):
+                    # Use raw torch.load instead of mlflow
+                    loaded = torch.load(model_path)
+                    if torch.cuda.is_available(): 
+                        loaded.to("cuda").float()
+                    
+                    GLOBAL_MODEL_CACHE[user_id] = loaded
+                    GLOBAL_TRAIN_COUNTER[user_id] = latest_v_num
+                    count += 1
+            except Exception as e:
+                logger.warning(f"Error loading model for {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Warm up error: {e}")
+    
     logger.info(f"🚀 WARM UP COMPLETE: Loaded {count} models into memory.")
 
 def memory_manager_worker():
@@ -159,6 +297,37 @@ def memory_manager_worker():
                 cp.get_default_memory_pool().free_all_blocks()
             pytime.sleep(10)
         except: pytime.sleep(30)
+
+def model_janitor_worker():
+    """Deletes models for hosts that haven't been seen in 48 hours to save disk space."""
+    TTL_SECONDS = 48 * 3600
+    while True:
+        try:
+            if os.path.exists(MODEL_DIR):
+                now = pytime.time()
+                for host_dir_name in os.listdir(MODEL_DIR):
+                    if not host_dir_name.startswith("dfp-"): continue
+                    host_path = os.path.join(MODEL_DIR, host_dir_name)
+                    
+                    # Check the mtime of the directory or the model file
+                    mtime = os.path.getmtime(host_path)
+                    if (now - mtime) > TTL_SECONDS:
+                        logger.info(f"🧹 JANITOR: Pruning stale host model: {host_dir_name} (Last seen > 48h ago)")
+                        shutil.rmtree(host_path)
+                        
+                        # Also remove from memory cache if present
+                        user_id = host_dir_name.replace("dfp-", "")
+                        with MODEL_CACHE_LOCK:
+                            if user_id in GLOBAL_MODEL_CACHE:
+                                del GLOBAL_MODEL_CACHE[user_id]
+                                if user_id in GLOBAL_TRAIN_COUNTER:
+                                    del GLOBAL_TRAIN_COUNTER[user_id]
+            
+            # Run every 6 hours
+            pytime.sleep(6 * 3600)
+        except Exception as e:
+            logger.error(f"Janitor error: {e}")
+            pytime.sleep(3600)
 
 # --- STAGES ---
 
@@ -223,13 +392,19 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     df["feature_proc_hash"] = (procs.hash_values() % 1000).astype("float32") / 1000.0
                     for i in range(NUM_LOG_FEATURES): df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 1000).astype("float32") / 1000.0
                 else: df["source"] = "unknown_source"
-                now = datetime.utcnow(); hour = now.hour + now.minute / 60.0; day = now.weekday()
-                df["feature_hour_sin"] = float(np.sin(2 * np.pi * hour / 24.0))
-                df["feature_hour_cos"] = float(np.cos(2 * np.pi * hour / 24.0))
-                df["feature_day_sin"] = float(np.sin(2 * np.pi * day / 7.0))
-                df["feature_day_cos"] = float(np.cos(2 * np.pi * day / 7.0))
+
+                now = datetime.utcnow()
                 rows = len(df); time_offsets = cp.arange(rows, dtype='int64') * 1000 
                 df["timestamp"] = cudf.to_datetime(time_offsets + int(now.timestamp() * 1e9), unit="ns")
+
+                # Per-row time features (Vectorized on GPU)
+                hours = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
+                days = df["timestamp"].dt.weekday.astype("float32")
+                
+                df["feature_hour_sin"] = cp.sin(2 * np.pi * hours / 24.0).astype("float32")
+                df["feature_hour_cos"] = cp.cos(2 * np.pi * hours / 24.0).astype("float32")
+                df["feature_day_sin"] = cp.sin(2 * np.pi * days / 7.0).astype("float32")
+                df["feature_day_cos"] = cp.cos(2 * np.pi * days / 7.0).astype("float32")
             except Exception as e: logger.error(f"Preprocessing Early Error: {e}")
         return msg
     def _build_single(self, builder, input_node):
@@ -272,7 +447,7 @@ class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
 class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
     def __init__(self, c):
         super().__init__(c); self._train_counter = {}; self._last_train_time = {} 
-        self._save_interval = 20; self._queue_semaphore = threading.Semaphore(64) 
+        self._save_interval = 50; self._queue_semaphore = threading.Semaphore(64) 
     @property
     def name(self): return "async-training"
     def accepted_types(self): return (ControlMessage,)
@@ -280,13 +455,50 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
     def _train_and_save(self, pdf, user_id, count):
         try:
             train_data = pdf[FEATURE_COLS]
+            
+            # INCLUDE FEEDBACK: Merge saved user overrides into the training set
+            feedback_path = os.path.join(FEEDBACK_DIR, f"{user_id}.json")
+            if os.path.exists(feedback_path):
+                try:
+                    with open(feedback_path, "r") as f:
+                        feedback_list = json.load(f)
+                    if feedback_list and isinstance(feedback_list, list):
+                        feedback_df = pd.DataFrame(feedback_list)
+                        # Upsample feedback so it carries weight in the full training batch
+                        # (repeating feedback 10x vs the thousand+ samples in pdf)
+                        feedback_upsampled = pd.concat([feedback_df] * 10, ignore_index=True)
+                        train_data = pd.concat([train_data, feedback_upsampled], ignore_index=True)
+                        logger.info(f"🧬 AUGMENTED: Added {len(feedback_list)} feedback samples (upsampled to {len(feedback_upsampled)}) to training for {user_id}")
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"⚠️ Training: Skipping corrupted feedback for {user_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Error loading feedback for {user_id}: {e}")
+
             with MODEL_CACHE_LOCK:
                 if user_id not in GLOBAL_MODEL_CACHE:
-                    GLOBAL_MODEL_CACHE[user_id] = AutoEncoder(encoder_layers=[32, 16], decoder_layers=[16, 32], activation='relu', patience=None)
+                    # PROPER BOTTLENECK: [12, 8] for 19 features ensures useful compression
+                    GLOBAL_MODEL_CACHE[user_id] = AutoEncoder(encoder_layers=[12, 8], decoder_layers=[8, 12], activation='relu', patience=None)
                     if torch.cuda.is_available(): GLOBAL_MODEL_CACHE[user_id].to("cuda").float()
             model = GLOBAL_MODEL_CACHE.get(user_id)
             if not model: return
-            with TRAINING_LOCK: model.fit(train_data, epochs=1) 
+
+            # CALCULATE NORMALIZATION BEFORE TRAINING
+            data_matrix = train_data.values
+            if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            means = np.mean(data_matrix, axis=0)
+            stds = np.std(data_matrix, axis=0)
+            # SENSITIVE NORMALIZATION: Floor of 0.1 is more appropriate for 0-1 features
+            robust_stds = np.maximum(stds, 0.1)
+            
+            # Normalize the training data so model learns on scaled input (MATCHES INFERENCE)
+            # Using pandas broadcasting for consistency with FEATURE_COLS
+            normalized_train_data = (train_data - means) / robust_stds
+            
+            with TRAINING_LOCK: 
+                # Train for 3 epochs for better convergence
+                model.fit(normalized_train_data, epochs=3) 
             
             # SYNC: Update global counter so inference engine knows we have progressed
             with MODEL_CACHE_LOCK:
@@ -295,26 +507,28 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             # SIGNAL: Notify inference engine that metadata (version/means) has changed
             MODEL_UPDATED_EVENT.set()
 
-            data_matrix = train_data.values
-            if hasattr(data_matrix, 'get'): data_matrix = data_matrix.get()
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            # ROBUST NORMALIZATION: Enforce a floor of 1.0 for standard deviation
-            # This ensures that a single discrete change (e.g. 0 -> 1) is treated as a 1.0 sigma event
-            # rather than a 10,000.0 sigma event.
-            stds = np.std(data_matrix, axis=0)
-            robust_stds = np.maximum(stds, 1.0)
-            
-            model.register_buffer("saved_means", torch.tensor(np.mean(data_matrix, axis=0), dtype=torch.float32, device=device))
+            # Update Buffers
+            model.register_buffer("saved_means", torch.tensor(means, dtype=torch.float32, device=device))
             model.register_buffer("saved_scales", torch.tensor(robust_stds, dtype=torch.float32, device=device))
+            
             if count == 1 or (count > 0 and count % self._save_interval == 0):
-                with MLFLOW_LOCK:
-                    host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
-                    if count == 1: shutil.rmtree(host_dir, ignore_errors=True)
-                    version_dir = os.path.join(host_dir, f"version-{count}"); model_save_path = os.path.join(version_dir, "model")
-                    os.makedirs(version_dir, exist_ok=True)
-                    mlflow.pytorch.save_model(model, path=model_save_path, pip_requirements=["torch", "mlflow", "pandas"])
-                    MODEL_UPDATED_EVENT.set(); logger.info(f"💾 SAVED: Host {user_id} Version {count}")
+                host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
+                if count == 1: shutil.rmtree(host_dir, ignore_errors=True)
+                os.makedirs(host_dir, exist_ok=True)
+                
+                # LIGHTWEIGHT SAVE: (~200KB vs ~15MB MLflow overhead)
+                model_save_path = os.path.join(host_dir, f"model-v{count}.pt")
+                torch.save(model, model_save_path)
+                
+                # VERSION PRUNING: Only keep the latest version on disk
+                try:
+                    for f in os.listdir(host_dir):
+                        if f.startswith("model-v") and f != f"model-v{count}.pt":
+                            os.remove(os.path.join(host_dir, f))
+                except Exception as e:
+                    logger.warning(f"Version pruning error for {user_id}: {e}")
+                
+                MODEL_UPDATED_EVENT.set(); logger.info(f"💾 SAVED: Host {user_id} Version {count} (Lightweight)")
         except Exception as e: logger.error(f"❌ Training Thread Error for {user_id}: {e}")
         finally:
              self._queue_semaphore.release()
@@ -332,7 +546,11 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             with TRAINING_SET_LOCK:
                 if user_id in TRAINING_IN_PROGRESS: continue
             if not self._queue_semaphore.acquire(blocking=False): continue
-            with MODEL_CACHE_LOCK: self._train_counter[user_id] = max(self._train_counter.get(user_id, 0), GLOBAL_TRAIN_COUNTER.get(user_id, 0)) + 1
+            
+            # Per-host versioning: increment from last known version for this specific host
+            with MODEL_CACHE_LOCK: 
+                self._train_counter[user_id] = self._train_counter.get(user_id, GLOBAL_TRAIN_COUNTER.get(user_id, 0)) + 1
+            
             count = self._train_counter[user_id]; logger.info(f"⚡ TRAINING START: Host {user_id} ({counts[user_id]}) - V{count}")
             self._last_train_time[user_id] = pytime.time()
             with TRAINING_SET_LOCK: 
@@ -454,9 +672,12 @@ class ManualInferenceStage(SinglePortStage):
             
             # REFINED SCALING: Smoother curve to prevent the 0.0 or 10.0 binary behavior
             # Map score to 0-10 range with a sigmoid-like curve for better forensic detail
-            scaled_scores = cp.where(scores_cp <= 1.0, 
-                                     scores_cp * 2.5, # 0.0-1.0 maps to 0.0-2.5
-                                     2.5 + cp.log1p(cp.maximum(0, scores_cp - 1.0)) * 2.5) # log-scale above 2.5
+            # RawLoss of 1.0 (1 std floor) -> ~2.0
+            # RawLoss of 5.0 (5 std floor) -> ~5.5
+            # RawLoss of 20.0 (20 std floor) -> ~9.0
+            scaled_scores = cp.where(scores_cp <= 1.5, 
+                                     scores_cp * 2.0, # 0.0-1.5 maps to 0.0-3.0
+                                     3.0 + cp.log1p(cp.maximum(0, scores_cp - 1.5)) * 2.0) # smoother log growth
             
             scaled_scores = cp.where(is_learning_cp, 0.0, cp.clip(scaled_scores, 0.0, 10.0))
             
@@ -651,7 +872,11 @@ class StringTritonInferenceStage(SinglePortStage):
 def run_inference_pipeline():
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR, exist_ok=True)
     os.environ["MLFLOW_TRACKING_URI"] = f"file://{MODEL_DIR}"
-    warm_up_model_cache(); threading.Thread(target=memory_manager_worker, daemon=True).start(); threading.Thread(target=run_health_server, daemon=True).start()
+    warm_up_model_cache()
+    threading.Thread(target=memory_manager_worker, daemon=True).start()
+    threading.Thread(target=model_janitor_worker, daemon=True).start()
+    threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=control_worker, daemon=True).start()
     while True:
         try:
             config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = 32768; config.edge_buffer_size = 32768; config.mode = "AE"; config.num_threads = 8
