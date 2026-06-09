@@ -3,4 +3,6 @@ dfp-models/*
 *.tmp
 ingest-syslog/
 GEMINI.md
-CLAUDE.md
+CLAUDE.md*.pyc
+__pycache__/
+.pytest_cache/
