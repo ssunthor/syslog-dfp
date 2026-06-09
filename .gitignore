@@ -2,3 +2,5 @@ dfp-models/*
 *.bak
 *.tmp
 ingest-syslog/
+GEMINI.md
+CLAUDE.md
