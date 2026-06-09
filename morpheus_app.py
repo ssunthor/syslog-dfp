@@ -450,8 +450,10 @@ class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
                 # Use the actual timestamp range of the batch to compute a real EPS.
                 # Previously this used (rows * 1µs) as the window, producing values ~100x too high.
                 if "timestamp" in df.columns:
-                    ts_range_ns = float((df["timestamp"].max() - df["timestamp"].min()).value)
-                    duration_sec = max(ts_range_ns / 1e9, 1.0)  # floor at 1s for same-second batches
+                    # cuDF max/min on datetime returns numpy.timedelta64 (not pandas.Timedelta),
+                    # so use pd.Timedelta() conversion to get total_seconds() reliably.
+                    ts_diff = pd.Timedelta(df["timestamp"].max() - df["timestamp"].min())
+                    duration_sec = max(ts_diff.total_seconds(), 1.0)  # floor at 1s for same-second batches
                 else:
                     duration_sec = 2.0  # AccumulatorStage max_latency fallback
                 counts = df['source'].value_counts()
