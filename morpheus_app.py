@@ -596,9 +596,12 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
         if msg is None: return None
         df = msg.payload().df; source_col = "source" if "source" in df.columns else "hostname" if "hostname" in df.columns else "host" if "host" in df.columns else None
         if not source_col: return msg
-        counts = df[source_col].value_counts(); active_hosts = counts[counts >= 100].index.to_arrow().to_pylist()
+        # Only train on rows Triton successfully classified; rows with Triton down have
+        # all Triton-derived features zeroed out and would corrupt the model baseline.
+        train_df = df[df["triton_classified"] == True] if "triton_classified" in df.columns else df
+        counts = train_df[source_col].value_counts(); active_hosts = counts[counts >= 100].index.to_arrow().to_pylist()
         if not active_hosts: return msg
-        pdf = df[df[source_col].isin(active_hosts)].to_pandas()
+        pdf = train_df[train_df[source_col].isin(active_hosts)].to_pandas()
         for user_id in active_hosts:
             if pytime.time() - self._last_train_time.get(user_id, 0) < 60: continue
             with TRAINING_SET_LOCK:
@@ -884,6 +887,8 @@ class StringTritonInferenceStage(SinglePortStage):
 
     def _process(self, msg: ControlMessage):
         if msg is None: return None
+        with msg.payload().mutable_dataframe() as df:
+            df["triton_classified"] = False
         if self._ensure_client():
             try:
                 meta = msg.payload()
@@ -921,6 +926,7 @@ class StringTritonInferenceStage(SinglePortStage):
                             df[out.name] = result.flatten()
                             # CRITICAL: Map to feature column so ManualInferenceStage can see it!
                             df[f"feature_{out.name}"] = df[out.name].astype("float32")
+                    df["triton_classified"] = True
             except Exception as e:
                 logger.error(f"❌ Triton inference failed: {e}")
         return msg
