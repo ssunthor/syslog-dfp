@@ -335,6 +335,7 @@ class TestFeedbackProcessing:
 # TIER 2: GPU OPERATION TESTS  (cuDF/CuPy; no Morpheus stages)
 # =============================================================================
 
+@pytest.mark.gpu
 @requires_gpu
 class TestGPUHashFeatures:
     """Verify the CuPy hash operations produce correctly-shaped, in-range outputs."""
@@ -379,6 +380,7 @@ class TestGPUHashFeatures:
         assert float(cp.min(result)) >= 0.0
 
 
+@pytest.mark.gpu
 @requires_gpu
 class TestGPUTemporalFeatures:
     """sin/cos features must stay in [-1, 1] for any valid timestamp."""
@@ -423,6 +425,7 @@ class TestGPUTemporalFeatures:
         assert abs(float(sin_vals[1])) < 1e-5
 
 
+@pytest.mark.gpu
 @requires_gpu
 class TestAccumulatorIndexSafety:
     """Guard against the duplicate-index regression that caused column size mismatches."""
@@ -502,6 +505,7 @@ def _make_msg(messages):
     return msg
 
 
+@pytest.mark.morpheus
 @requires_morpheus
 class TestGPUPreprocessingStage:
     def setup_method(self):
@@ -561,6 +565,7 @@ class TestGPUPreprocessingStage:
                 assert str(df[col].dtype) == "float32", f"{col} dtype={df[col].dtype}"
 
 
+@pytest.mark.morpheus
 @requires_morpheus
 class TestTritonFallback:
     """When Triton is unreachable every row must have triton_classified=False."""
