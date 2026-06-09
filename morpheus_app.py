@@ -404,9 +404,12 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     df["feature_msg_len"] = (msg_col.str.len() / 512.0).astype("float32").clip(0.0, 1.0)
                     users = msg_col.str.extract(self._user_regex, expand=True)[0].fillna("none")
                     procs = msg_col.str.extract(self._process_regex, expand=True)[0].fillna("unknown")
-                    df["feature_user_hash"] = (users.hash_values() % 100000).astype("float32") / 100000.0
-                    df["feature_proc_hash"] = (procs.hash_values() % 100000).astype("float32") / 100000.0
-                    for i in range(NUM_LOG_FEATURES): df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 100000).astype("float32") / 100000.0
+                    # Extract to CuPy arrays before arithmetic to bypass cuDF index alignment.
+                    # cp.abs() normalises negative int32 hash values before the modulo.
+                    df["feature_user_hash"] = (cp.abs(users.hash_values().values) % cp.int32(100000)).astype(cp.float32) / cp.float32(100000.0)
+                    df["feature_proc_hash"] = (cp.abs(procs.hash_values().values) % cp.int32(100000)).astype(cp.float32) / cp.float32(100000.0)
+                    for i in range(NUM_LOG_FEATURES):
+                        df[f"feature_log_v{i}"] = (cp.abs(msg_col.hash_values(seed=i).values) % cp.int32(100000)).astype(cp.float32) / cp.float32(100000.0)
 
                     # Parse actual syslog timestamps so temporal features reflect real event time.
                     # Use pandas on the CPU: pd.to_datetime fully supports errors='coerce' for
@@ -436,14 +439,13 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     df["source"] = "unknown_source"
                     df["timestamp"] = pd.Timestamp(now)
 
-                # Per-row time features (Vectorized on GPU)
-                hours = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
-                days = df["timestamp"].dt.weekday.astype("float32")
-
-                df["feature_hour_sin"] = cp.sin(2 * np.pi * hours / 24.0).astype("float32")
-                df["feature_hour_cos"] = cp.cos(2 * np.pi * hours / 24.0).astype("float32")
-                df["feature_day_sin"] = cp.sin(2 * np.pi * days / 7.0).astype("float32")
-                df["feature_day_cos"] = cp.cos(2 * np.pi * days / 7.0).astype("float32")
+                # Per-row time features — extract to CuPy to bypass cuDF index alignment.
+                hours_cp = (df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0).values
+                days_cp = df["timestamp"].dt.weekday.astype("float32").values
+                df["feature_hour_sin"] = cp.sin(2 * cp.float32(cp.pi) * hours_cp / cp.float32(24.0)).astype(cp.float32)
+                df["feature_hour_cos"] = cp.cos(2 * cp.float32(cp.pi) * hours_cp / cp.float32(24.0)).astype(cp.float32)
+                df["feature_day_sin"] = cp.sin(2 * cp.float32(cp.pi) * days_cp / cp.float32(7.0)).astype(cp.float32)
+                df["feature_day_cos"] = cp.cos(2 * cp.float32(cp.pi) * days_cp / cp.float32(7.0)).astype(cp.float32)
             except Exception as e: logger.error(f"Preprocessing Early Error: {e}")
         return msg
     def _build_single(self, builder, input_node):
@@ -920,48 +922,40 @@ class StringTritonInferenceStage(SinglePortStage):
 
     def _process(self, msg: ControlMessage):
         if msg is None: return None
+        # Single mutable_dataframe() context: set triton_classified=False as default,
+        # overwrite with True only after a successful Triton response.  Calling
+        # mutable_dataframe() twice on the same MessageMeta in the same invocation is
+        # fragile in Morpheus 25.x and was the likely cause of the column-size mismatch.
         with msg.payload().mutable_dataframe() as df:
             df["triton_classified"] = False
-        if self._ensure_client():
-            try:
-                meta = msg.payload()
-                with meta.mutable_dataframe() as df:
+            if self._ensure_client():
+                try:
                     batch_size = len(df)
-                    
-                    # DEBUG: Throttled Logging (Every 100 batches)
                     do_log = (self._debug_counter % 100 == 0)
                     self._debug_counter += 1
-                    
                     if do_log:
                         logger.info(f"🔵 TRITON CALL: model={self._model_name}, batch_size={batch_size}")
-                    
-                    # to_pandas() is required for strings as to_arrow() often enforces zero_copy_only
+                    # to_pandas() is required for strings as to_arrow() enforces zero_copy_only
                     msg_array = df["message"].to_pandas().values.astype(object).reshape(-1, 1)
-                    
                     from tritonclient.grpc import InferInput, InferRequestedOutput
                     inputs = [InferInput("input_message", msg_array.shape, "BYTES")]
                     inputs[0].set_data_from_numpy(msg_array)
                     outputs = [InferRequestedOutput(out.name) for out in self.output_mapping]
-                    
                     response = self._client.infer(self._model_name, inputs, outputs=outputs)
-                    
                     if do_log:
                         samples = min(3, batch_size)
                         for i in range(samples):
                             msg_peek = str(msg_array[i][0])[:60].replace("\n", " ")
                             results_peek = {out.name: response.as_numpy(out.name)[i] for out in self.output_mapping}
                             logger.info(f"   Sample {i}: '{msg_peek}...' -> {results_peek}")
-
                     for out in self.output_mapping:
                         result = response.as_numpy(out.name)
                         if result is not None:
-                            # OPTIMIZATION: Assign numpy array directly to cudf (Zero-copy where possible)
                             df[out.name] = result.flatten()
-                            # CRITICAL: Map to feature column so ManualInferenceStage can see it!
                             df[f"feature_{out.name}"] = df[out.name].astype("float32")
                     df["triton_classified"] = True
-            except Exception as e:
-                logger.error(f"❌ Triton inference failed: {e}")
+                except Exception as e:
+                    logger.error(f"❌ Triton inference failed: {e}")
         return msg
 
     def _build_single(self, builder, input_node):
