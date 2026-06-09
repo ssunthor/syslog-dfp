@@ -365,12 +365,14 @@ class AccumulatorStage(SinglePortStage):
 
 @register_stage("gpu-preprocessing")
 class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
-    def __init__(self, c): 
+    def __init__(self, c):
         super().__init__(c)
         self._ip_regex = r"from\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
         self._host_regex = r"(?:<\d+>)?([A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+([a-zA-Z0-9\.\-_]+)"
         self._user_regex = r"(?:user|for user|User|User=)\s*([a-zA-Z0-9\.\-_]+)"
         self._process_regex = r"(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+[a-zA-Z0-9\.\-_]+\s+([a-zA-Z0-9\.\-_]+)(?:\[\d+\])?: "
+        # RFC 5424: <PRI>VERSION ISO-TIMESTAMP hostname ...
+        self._rfc5424_ts_regex = r"(?:<\d+>)\d+\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
     @property
     def name(self): return "gpu-preprocessing"
     def accepted_types(self): return (ControlMessage,)
@@ -380,6 +382,7 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
         with msg.payload().mutable_dataframe() as df:
             try:
                 for col in FEATURE_COLS: df[col] = 0.0
+                now = datetime.utcnow()
                 if "message" in df.columns:
                     msg_col = df["message"]
                     extracted_host = msg_col.str.extract(self._host_regex, expand=True)[1]
@@ -391,16 +394,34 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     df["feature_user_hash"] = (users.hash_values() % 1000).astype("float32") / 1000.0
                     df["feature_proc_hash"] = (procs.hash_values() % 1000).astype("float32") / 1000.0
                     for i in range(NUM_LOG_FEATURES): df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 1000).astype("float32") / 1000.0
-                else: df["source"] = "unknown_source"
 
-                now = datetime.utcnow()
-                rows = len(df); time_offsets = cp.arange(rows, dtype='int64') * 1000 
-                df["timestamp"] = cudf.to_datetime(time_offsets + int(now.timestamp() * 1e9), unit="ns")
+                    # Parse actual syslog timestamps so temporal features reflect real event time.
+                    # Try RFC 3164 first ("Jan  1 12:00:00"), then RFC 5424 ("2026-01-01T12:00:00").
+                    # Rows that match neither fall back to processing time.
+                    fallback_ts = pd.Timestamp(now)
+
+                    # RFC 3164: group 0 of _host_regex is the timestamp string
+                    ts_raw_3164 = msg_col.str.extract(self._host_regex, expand=True)[0]
+                    # Collapse multi-spaces (space-padded single-digit day: "Jan  1" -> "Jan 1")
+                    ts_norm_3164 = ts_raw_3164.str.replace(r'\s+', ' ', regex=True).str.strip()
+                    year_prefix = cudf.Series([str(now.year) + " "] * len(df))
+                    ts_with_year = year_prefix + ts_norm_3164
+                    parsed_3164 = cudf.to_datetime(ts_with_year, format="%Y %b %d %H:%M:%S", errors='coerce')
+
+                    # RFC 5424: ISO timestamp in group 0 (truncated to seconds for parsing)
+                    ts_raw_5424 = msg_col.str.extract(self._rfc5424_ts_regex, expand=True)[0]
+                    parsed_5424 = cudf.to_datetime(ts_raw_5424, format="%Y-%m-%dT%H:%M:%S", errors='coerce')
+
+                    # Prefer RFC 3164, fall back to RFC 5424, then processing time
+                    df["timestamp"] = parsed_3164.fillna(parsed_5424).fillna(fallback_ts)
+                else:
+                    df["source"] = "unknown_source"
+                    df["timestamp"] = pd.Timestamp(now)
 
                 # Per-row time features (Vectorized on GPU)
                 hours = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
                 days = df["timestamp"].dt.weekday.astype("float32")
-                
+
                 df["feature_hour_sin"] = cp.sin(2 * np.pi * hours / 24.0).astype("float32")
                 df["feature_hour_cos"] = cp.cos(2 * np.pi * hours / 24.0).astype("float32")
                 df["feature_day_sin"] = cp.sin(2 * np.pi * days / 7.0).astype("float32")
@@ -421,9 +442,15 @@ class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
         if msg is None: return None
         with msg.payload().mutable_dataframe() as df:
             try:
-                rows = len(df); duration_sec = max(float(rows) * 1000.0 / 1e9, 0.001)
+                # Use the actual timestamp range of the batch to compute a real EPS.
+                # Previously this used (rows * 1µs) as the window, producing values ~100x too high.
+                if "timestamp" in df.columns:
+                    ts_range_ns = float((df["timestamp"].max() - df["timestamp"].min()).value)
+                    duration_sec = max(ts_range_ns / 1e9, 1.0)  # floor at 1s for same-second batches
+                else:
+                    duration_sec = 2.0  # AccumulatorStage max_latency fallback
                 counts = df['source'].value_counts()
-                
+
                 # OPTIMIZATION: Log-scaled volume (Prevents volume spikes from exploding the score)
                 eps = (df['source'].map(counts) / duration_sec * 60.0).astype('float32')
                 df['feature_log_count'] = cp.log1p(eps) / 10.0 # Normalized roughly for 0-20k EPS
@@ -496,20 +523,21 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             # Using pandas broadcasting for consistency with FEATURE_COLS
             normalized_train_data = (train_data - means) / robust_stds
             
-            with TRAINING_LOCK: 
+            with TRAINING_LOCK:
                 # Train for 3 epochs for better convergence
-                model.fit(normalized_train_data, epochs=3) 
-            
-            # SYNC: Update global counter so inference engine knows we have progressed
-            with MODEL_CACHE_LOCK:
-                GLOBAL_TRAIN_COUNTER[user_id] = max(GLOBAL_TRAIN_COUNTER.get(user_id, 0), count)
-            
-            # SIGNAL: Notify inference engine that metadata (version/means) has changed
-            MODEL_UPDATED_EVENT.set()
+                model.fit(normalized_train_data, epochs=3)
 
-            # Update Buffers
+            # Register normalization buffers on the model BEFORE signaling the inference engine.
+            # Previously MODEL_UPDATED_EVENT was set first, creating a race where _build_gpu_lookups
+            # could read model.saved_means before register_buffer had run, loading stale stats.
             model.register_buffer("saved_means", torch.tensor(means, dtype=torch.float32, device=device))
             model.register_buffer("saved_scales", torch.tensor(robust_stds, dtype=torch.float32, device=device))
+
+            # SYNC: Update global counter, then signal inference engine
+            with MODEL_CACHE_LOCK:
+                GLOBAL_TRAIN_COUNTER[user_id] = max(GLOBAL_TRAIN_COUNTER.get(user_id, 0), count)
+
+            MODEL_UPDATED_EVENT.set()
             
             if count == 1 or (count > 0 and count % self._save_interval == 0):
                 host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
