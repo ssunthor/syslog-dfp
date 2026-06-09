@@ -123,6 +123,15 @@ GLOBAL_MODEL_CACHE = {}
 GLOBAL_TRAIN_COUNTER = {}
 MODEL_CACHE_LOCK = threading.Lock()
 
+# Per-host rolling window of recent feature vectors used for DFP training.
+# Without this, each training run only sees the current 2-second batch (100-16k rows),
+# which is far too little data to learn stable behavioral baselines.
+# DFP_ROLLING_WINDOW_ROWS controls the cap per host (default: 50k rows).
+# At 100 EPS per host that is ~8 minutes of history; tune upward for busier hosts.
+ROLLING_WINDOW_CACHE = {}   # {user_id: pd.DataFrame}
+ROLLING_WINDOW_LOCK = threading.Lock()
+ROLLING_WINDOW_MAX_ROWS = int(os.getenv("DFP_ROLLING_WINDOW_ROWS", "50000"))
+
 CONTROL_TOPIC = os.getenv("KAFKA_CONTROL_TOPIC", "morpheus-control")
 
 def process_feedback_locally(source, features):
@@ -316,13 +325,16 @@ def model_janitor_worker():
                         logger.info(f"🧹 JANITOR: Pruning stale host model: {host_dir_name} (Last seen > 48h ago)")
                         shutil.rmtree(host_path)
                         
-                        # Also remove from memory cache if present
+                        # Also remove from in-memory caches
                         user_id = host_dir_name.replace("dfp-", "")
                         with MODEL_CACHE_LOCK:
                             if user_id in GLOBAL_MODEL_CACHE:
                                 del GLOBAL_MODEL_CACHE[user_id]
                                 if user_id in GLOBAL_TRAIN_COUNTER:
                                     del GLOBAL_TRAIN_COUNTER[user_id]
+                        with ROLLING_WINDOW_LOCK:
+                            if user_id in ROLLING_WINDOW_CACHE:
+                                del ROLLING_WINDOW_CACHE[user_id]
             
             # Run every 6 hours
             pytime.sleep(6 * 3600)
@@ -504,9 +516,9 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
     def name(self): return "async-training"
     def accepted_types(self): return (ControlMessage,)
     def supports_cpp_node(self): return False
-    def _train_and_save(self, pdf, user_id, count):
+    def _train_and_save(self, window_snapshot, user_id, count):
         try:
-            train_data = pdf[FEATURE_COLS]
+            train_data = window_snapshot  # already FEATURE_COLS only (from ROLLING_WINDOW_CACHE)
             
             # INCLUDE FEEDBACK: Merge saved user overrides into the training set
             feedback_path = os.path.join(FEEDBACK_DIR, f"{user_id}.json")
@@ -599,24 +611,45 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
         # Only train on rows Triton successfully classified; rows with Triton down have
         # all Triton-derived features zeroed out and would corrupt the model baseline.
         train_df = df[df["triton_classified"] == True] if "triton_classified" in df.columns else df
-        counts = train_df[source_col].value_counts(); active_hosts = counts[counts >= 100].index.to_arrow().to_pylist()
-        if not active_hosts: return msg
-        pdf = train_df[train_df[source_col].isin(active_hosts)].to_pandas()
-        for user_id in active_hosts:
+        if len(train_df) == 0: return msg
+
+        # Append this batch's classified feature vectors to each host's rolling window.
+        # Training then uses the full window, not just the current 2-second batch.
+        batch_pdf = train_df[[source_col] + FEATURE_COLS].to_pandas()
+        with ROLLING_WINDOW_LOCK:
+            for uid, group in batch_pdf.groupby(source_col):
+                new_rows = group[FEATURE_COLS]
+                if uid in ROLLING_WINDOW_CACHE:
+                    ROLLING_WINDOW_CACHE[uid] = pd.concat(
+                        [ROLLING_WINDOW_CACHE[uid], new_rows], ignore_index=True
+                    ).tail(ROLLING_WINDOW_MAX_ROWS)
+                else:
+                    ROLLING_WINDOW_CACHE[uid] = new_rows.reset_index(drop=True)
+
+        counts = train_df[source_col].value_counts()
+        # Require at least 100 rows in the rolling window (not just this batch) before training
+        with ROLLING_WINDOW_LOCK:
+            eligible = [uid for uid in ROLLING_WINDOW_CACHE if len(ROLLING_WINDOW_CACHE[uid]) >= 100]
+        if not eligible: return msg
+
+        for user_id in eligible:
             if pytime.time() - self._last_train_time.get(user_id, 0) < 60: continue
             with TRAINING_SET_LOCK:
                 if user_id in TRAINING_IN_PROGRESS: continue
             if not self._queue_semaphore.acquire(blocking=False): continue
-            
-            # Per-host versioning: increment from last known version for this specific host
-            with MODEL_CACHE_LOCK: 
+
+            with MODEL_CACHE_LOCK:
                 self._train_counter[user_id] = self._train_counter.get(user_id, GLOBAL_TRAIN_COUNTER.get(user_id, 0)) + 1
-            
-            count = self._train_counter[user_id]; logger.info(f"⚡ TRAINING START: Host {user_id} ({counts[user_id]}) - V{count}")
+            count = self._train_counter[user_id]
+
+            with ROLLING_WINDOW_LOCK:
+                window_snapshot = ROLLING_WINDOW_CACHE[user_id].copy()
+
+            logger.info(f"⚡ TRAINING START: Host {user_id} (window={len(window_snapshot)}) - V{count}")
             self._last_train_time[user_id] = pytime.time()
-            with TRAINING_SET_LOCK: 
+            with TRAINING_SET_LOCK:
                 TRAINING_IN_PROGRESS.add(user_id)
-            user_data = pdf[pdf[source_col] == user_id].copy(); TRAINING_EXECUTOR.submit(self._train_and_save, user_data, user_id, count)
+            TRAINING_EXECUTOR.submit(self._train_and_save, window_snapshot, user_id, count)
         return msg
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
