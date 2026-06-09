@@ -129,8 +129,9 @@ def process_feedback_locally(source, features):
     """Internal logic to save feedback and fine-tune model if loaded."""
     if not source or not features: return None
     
-    # Filter only relevant feature columns
-    filtered_features = {k: v for k, v in features.items() if k in FEATURE_COLS}
+    # Ensure all 19 feature columns are present; missing keys default to 0.0 to prevent
+    # NaN values when this dict is later concatenated with the full training DataFrame.
+    filtered_features = {k: float(features.get(k, 0.0)) for k in FEATURE_COLS}
     
     feedback_path = os.path.join(FEEDBACK_DIR, f"{source}.json")
     try:
@@ -391,9 +392,9 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     df["feature_msg_len"] = (msg_col.str.len() / 512.0).astype("float32").clip(0.0, 1.0)
                     users = msg_col.str.extract(self._user_regex, expand=True)[0].fillna("none")
                     procs = msg_col.str.extract(self._process_regex, expand=True)[0].fillna("unknown")
-                    df["feature_user_hash"] = (users.hash_values() % 1000).astype("float32") / 1000.0
-                    df["feature_proc_hash"] = (procs.hash_values() % 1000).astype("float32") / 1000.0
-                    for i in range(NUM_LOG_FEATURES): df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 1000).astype("float32") / 1000.0
+                    df["feature_user_hash"] = (users.hash_values() % 100000).astype("float32") / 100000.0
+                    df["feature_proc_hash"] = (procs.hash_values() % 100000).astype("float32") / 100000.0
+                    for i in range(NUM_LOG_FEATURES): df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 100000).astype("float32") / 100000.0
 
                     # Parse actual syslog timestamps so temporal features reflect real event time.
                     # Use pandas on the CPU: pd.to_datetime fully supports errors='coerce' for
@@ -438,7 +439,24 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
 
 @register_stage("gpu-feature-mapping")
 class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
-    def __init__(self, c): super().__init__(c)
+    def __init__(self, c):
+        super().__init__(c)
+        # Load class counts from the Triton label encoders so we normalize priority and
+        # event_type by the actual number of classes rather than hardcoded guesses.
+        self._priority_classes = 8    # RFC 3164 has 8 severity levels (0-7); safe default
+        self._event_type_classes = 10  # fallback; overridden below if encoder loads
+        model_dir = os.environ.get("INFERENCE_MODELS_DIR", "/app/models/inference")
+        try:
+            for attr, filename in [("_priority_classes", "priority_label_encoder.joblib"),
+                                    ("_event_type_classes", "event_type_label_encoder.joblib")]:
+                path = os.path.join(model_dir, filename)
+                if os.path.exists(path):
+                    enc = joblib.load(path)
+                    if hasattr(enc, "classes_") and len(enc.classes_) > 1:
+                        setattr(self, attr, len(enc.classes_))
+                        logger.info(f"Loaded {filename}: {len(enc.classes_)} classes")
+        except Exception as e:
+            logger.warning(f"Could not load label encoders for feature normalization, using defaults: {e}")
     @property
     def name(self): return "gpu-feature-mapping"
     def accepted_types(self): return (ControlMessage,)
@@ -462,12 +480,12 @@ class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
                 eps = (df['source'].map(counts) / duration_sec * 60.0).astype('float32')
                 df['feature_log_count'] = cp.log1p(eps) / 10.0 # Normalized roughly for 0-20k EPS
                 
-                # Squashing discrete features to 0-1 range
+                # Normalize Triton class labels to [0, 1] using the actual number of classes.
+                # Dividing by (num_classes - 1) maps label 0 -> 0.0 and label N-1 -> 1.0.
                 if "priority" in df.columns:
-                    df["feature_priority"] = df["priority"].astype("float32") / 7.0
+                    df["feature_priority"] = df["priority"].astype("float32") / float(self._priority_classes - 1)
                 if "event_type" in df.columns:
-                    # Assuming max 100 event types, squash to 0-1
-                    df["feature_event_type"] = (df["event_type"].astype("float32") % 100) / 100.0
+                    df["feature_event_type"] = df["event_type"].astype("float32") / float(self._event_type_classes - 1)
                 if "is_security_event" in df.columns:
                     df["feature_is_security_event"] = df["is_security_event"].astype("float32")
                 
@@ -498,8 +516,13 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
                         feedback_list = json.load(f)
                     if feedback_list and isinstance(feedback_list, list):
                         feedback_df = pd.DataFrame(feedback_list)
+                        # Fill any columns missing from the feedback payload with 0.0 so the
+                        # concat below never introduces NaN values into the training matrix.
+                        for col in FEATURE_COLS:
+                            if col not in feedback_df.columns:
+                                feedback_df[col] = 0.0
+                        feedback_df = feedback_df[FEATURE_COLS]
                         # Upsample feedback so it carries weight in the full training batch
-                        # (repeating feedback 10x vs the thousand+ samples in pdf)
                         feedback_upsampled = pd.concat([feedback_df] * 10, ignore_index=True)
                         train_data = pd.concat([train_data, feedback_upsampled], ignore_index=True)
                         logger.info(f"🧬 AUGMENTED: Added {len(feedback_list)} feedback samples (upsampled to {len(feedback_upsampled)}) to training for {user_id}")
@@ -735,7 +758,7 @@ class ManualInferenceStage(SinglePortStage):
             big_df.loc[is_learning_gdf, "anomaly_cause"] = "Learning..."
             
             new_meta = MessageMeta(big_df); self._gc_anchor.append(new_meta); return new_meta
-        except Exception as e: logger.error(f"❌ Inference Flush Error: {e}"); self._buffer = []; self._buffer_count = 0; return None
+        except Exception as e: logger.error(f"❌ Inference Error: {e}"); return None
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
 
@@ -744,6 +767,9 @@ class PythonKafkaSink(SinglePortStage):
     def __init__(self, c, bootstrap_servers, output_topic):
         super().__init__(c); self._producer = Producer({'bootstrap.servers': bootstrap_servers, 'linger.ms': 100, 'compression.type': 'snappy'})
         self._topic = output_topic
+    def __del__(self):
+        try: self._producer.flush(timeout=5)
+        except Exception: pass
     @property
     def name(self): return "python-kafka-sink"
     def accepted_types(self): return (MessageMeta,)
