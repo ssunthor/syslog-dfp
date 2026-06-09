@@ -1,0 +1,60 @@
+# Test runner for the syslog-DFP pipeline.
+#
+# Runs inside the same image as production so tests exercise the real environment.
+# Triton is NOT started — Tier 3 tests either bypass Triton (GPUPreprocessingStage)
+# or explicitly test the failure path (TritonFallback uses a dead port).
+#
+# ── Quick start ───────────────────────────────────────────────────────────────
+#
+#   All tiers (auto-skips what the environment can't support):
+#     docker compose -f docker-compose.test.yaml run --rm test-runner
+#
+#   Tier 1 only (CPU, no GPU required):
+#     TEST_TIER=unit docker compose -f docker-compose.test.yaml run --rm test-runner
+#
+#   Tier 2 (GPU cuDF/CuPy, no Morpheus stack):
+#     TEST_TIER=gpu docker compose -f docker-compose.test.yaml run --rm test-runner
+#
+#   Tier 3 (full Morpheus stage tests):
+#     TEST_TIER=morpheus docker compose -f docker-compose.test.yaml run --rm test-runner
+#
+#   Run a single test by name (override command entirely):
+#     docker compose -f docker-compose.test.yaml run --rm test-runner \
+#       python -m pytest tests/ -k "test_accumulator_clean_index" -v
+#
+#   Extra pytest flags (e.g. stop on first failure, verbose):
+#     PYTEST_ARGS="-x -s" docker compose -f docker-compose.test.yaml run --rm test-runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: syslog-dfp-tests
+    runtime: nvidia
+    cap_add:
+      - SYS_NICE          # same as production; avoids capability warnings in Morpheus
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
+      TEST_TIER:   "${TEST_TIER:-all}"
+      PYTEST_ARGS: "${PYTEST_ARGS:-}"
+      # Point Morpheus model tracking at the isolated test volume (not production path).
+      MLFLOW_TRACKING_URI: "file:///app/models/dfp-models"
+    volumes:
+      # Mount the full source tree so tests pick up the current morpheus_app.py
+      # and tests/ without requiring a container rebuild on every code change.
+      - .:/app
+      # Isolated scratch volume for DFP model files written during tests.
+      # Mounted second so it shadows /app/models/dfp-models from the source mount,
+      # preventing test runs from writing into the host working directory.
+      - test-dfp-models:/app/models/dfp-models
+    working_dir: /app
+    command: ["bash", "tests/run_tests.sh"]
+
+volumes:
+  test-dfp-models:
+    # Named volume so model warm-up artifacts persist between runs (Tier 3 is faster
+    # on repeated runs).  To reset: docker compose -f docker-compose.test.yaml down -v
