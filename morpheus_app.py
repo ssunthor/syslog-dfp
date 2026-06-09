@@ -352,7 +352,7 @@ class AccumulatorStage(SinglePortStage):
         now = pytime.time()
         if self._count < self.batch_size and (now - self._last_flush < self.max_latency) and self._count < self.max_buffer_size: return None 
         try:
-            big_gdf = cudf.concat(self._buffer); self._buffer = []; self._count = 0; self._last_flush = now
+            big_gdf = cudf.concat(self._buffer, ignore_index=True); self._buffer = []; self._count = 0; self._last_flush = now
             dt = now - self._perf_last_time
             if dt >= 5.0:
                 # Log the total windowed throughput to accurately reflect pod performance
