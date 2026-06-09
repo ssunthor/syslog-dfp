@@ -398,19 +398,28 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     # Parse actual syslog timestamps so temporal features reflect real event time.
                     # Try RFC 3164 first ("Jan  1 12:00:00"), then RFC 5424 ("2026-01-01T12:00:00").
                     # Rows that match neither fall back to processing time.
+                    # NOTE: cudf.to_datetime errors='coerce' is not supported for Series in cuDF 25.x.
+                    # Pre-filter with .where(str.match(...)) to null out non-matching rows before
+                    # parsing so cudf.to_datetime never receives a bad (non-null) string.
                     fallback_ts = pd.Timestamp(now)
 
                     # RFC 3164: group 0 of _host_regex is the timestamp string
                     ts_raw_3164 = msg_col.str.extract(self._host_regex, expand=True)[0]
                     # Collapse multi-spaces (space-padded single-digit day: "Jan  1" -> "Jan 1")
                     ts_norm_3164 = ts_raw_3164.str.replace(r'\s+', ' ', regex=True).str.strip()
-                    year_prefix = cudf.Series([str(now.year) + " "] * len(df))
+                    year_prefix = cudf.Series([str(now.year) + " "] * len(df), index=df.index)
                     ts_with_year = year_prefix + ts_norm_3164
-                    parsed_3164 = cudf.to_datetime(ts_with_year, format="%Y %b %d %H:%M:%S", errors='coerce')
+                    # Null out rows that don't match the expected format before parsing
+                    rfc3164_valid = ts_with_year.str.match(
+                        r'^\d{4} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2}$'
+                    )
+                    parsed_3164 = cudf.to_datetime(
+                        ts_with_year.where(rfc3164_valid), format="%Y %b %d %H:%M:%S"
+                    )
 
-                    # RFC 5424: ISO timestamp in group 0 (truncated to seconds for parsing)
+                    # RFC 5424: str.extract already nulls non-matching rows, so no pre-filter needed
                     ts_raw_5424 = msg_col.str.extract(self._rfc5424_ts_regex, expand=True)[0]
-                    parsed_5424 = cudf.to_datetime(ts_raw_5424, format="%Y-%m-%dT%H:%M:%S", errors='coerce')
+                    parsed_5424 = cudf.to_datetime(ts_raw_5424, format="%Y-%m-%dT%H:%M:%S")
 
                     # Prefer RFC 3164, fall back to RFC 5424, then processing time
                     df["timestamp"] = parsed_3164.fillna(parsed_5424).fillna(fallback_ts)
