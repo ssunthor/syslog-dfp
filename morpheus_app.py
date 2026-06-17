@@ -327,8 +327,8 @@ def memory_manager_worker():
             if torch.cuda.is_available():
                 free, total = torch.cuda.mem_get_info(0)
                 gpu_pct = (1.0 - free / total) * 100.0
-            if cpu_pct > 60 or gpu_pct > 70:
-                if gpu_pct > 70:
+            if cpu_pct > 60 or gpu_pct > 85:
+                if gpu_pct > 85:
                     logging.getLogger(__name__).warning(
                         f"GPU memory pressure: {gpu_pct:.1f}% used — freeing caches"
                     )
