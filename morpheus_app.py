@@ -833,32 +833,55 @@ class ManualInferenceStage(SinglePortStage):
 @register_stage("python-kafka-sink")
 class PythonKafkaSink(SinglePortStage):
     def __init__(self, c, bootstrap_servers, output_topic):
-        super().__init__(c); self._producer = Producer({'bootstrap.servers': bootstrap_servers, 'linger.ms': 100, 'compression.type': 'snappy'})
+        super().__init__(c)
         self._topic = output_topic
+        self._producer = Producer({
+            'bootstrap.servers': bootstrap_servers,
+            'linger.ms': 100,
+            'compression.type': 'snappy',
+            'on_delivery': self._delivery_callback,
+        })
+
+    @staticmethod
+    def _delivery_callback(err, msg):
+        if err:
+            logger.error(f"❌ Kafka delivery failure: topic={msg.topic()} partition={msg.partition()} error={err}")
+
     def __del__(self):
-        try: self._producer.flush(timeout=5)
+        try: self._producer.flush(timeout=30)
         except Exception: pass
+
     @property
     def name(self): return "python-kafka-sink"
     def accepted_types(self): return (MessageMeta,)
     def supports_cpp_node(self): return False
     def compute_schema(self, schema): schema.output_schema.set_type(MessageMeta); return schema
+
     def _process(self, msg: MessageMeta):
         if msg is None: return None
         try:
             with msg.mutable_dataframe() as df:
-                # OPTIMIZATION: Use to_json() with lines=True for faster serialization
                 pdf = df.to_pandas()
                 keys = pdf['source'].values
                 json_batch = pdf.to_json(orient='records', lines=True, date_format='iso')
-                
                 for key, line in zip(keys, json_batch.splitlines()):
-                    if line:
-                        # KEYED PRODUCTION: Ensures host-stickiness across partitions
-                        self._producer.produce(self._topic, value=line.encode('utf-8'), key=str(key).encode('utf-8'))
+                    if not line:
+                        continue
+                    # Retry once on BufferError (producer queue full under load burst)
+                    for attempt in range(2):
+                        try:
+                            self._producer.produce(self._topic, value=line.encode('utf-8'), key=str(key).encode('utf-8'))
+                            break
+                        except BufferError:
+                            if attempt == 0:
+                                self._producer.poll(1)
+                            else:
+                                logger.warning(f"⚠️ Kafka producer queue full — dropping message for key={key}")
                 self._producer.poll(0)
-        except Exception as e: logger.error(f"❌ Kafka Sink Error: {e}")
+        except Exception as e:
+            logger.error(f"❌ Kafka Sink Error: {e}")
         return msg
+
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
 
@@ -1012,7 +1035,19 @@ def run_inference_pipeline():
 
             pipeline = LinearPipeline(config)
             # CONSISTENT GROUP ID: Allows multi-pod scaling across partitions
-            pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=KAFKA_GROUP_ID, auto_offset_reset="latest"))
+            pipeline.set_source(KafkaSource(
+                config,
+                bootstrap_servers=KAFKA_BROKER,
+                input_topic=INPUT_TOPIC,
+                group_id=KAFKA_GROUP_ID,
+                auto_offset_reset="latest",
+                kafka_consumer_params={
+                    "session.timeout.ms": "30000",
+                    "request.timeout.ms": "60000",
+                    # Must exceed the longest possible batch processing window
+                    "max.poll.interval.ms": "300000",
+                },
+            ))
             
             pipeline.add_stage(DeserializeStage(config))
             
