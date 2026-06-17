@@ -29,18 +29,32 @@ import mlflow
 
 # Initialize RMM with a fixed pool + failure callback so OOM attempts cache
 # flushes and retries before raising, rather than crashing the pipeline.
+_rmm_oom_count = 0
+_rmm_oom_window_start = 0.0
+
 def _rmm_oom_handler(nbytes, nothrow=False):
-    logging.getLogger(__name__).warning(
-        f"RMM pool exhausted (requested {nbytes:,} B) — flushing caches and retrying"
-    )
-    try:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        cp.get_default_memory_pool().free_all_blocks()
-        return True  # signal RMM to retry the allocation
-    except Exception:
-        return False
+    global _rmm_oom_count, _rmm_oom_window_start
+    now = pytime.time()
+    if now - _rmm_oom_window_start > 10.0:
+        _rmm_oom_count = 0
+        _rmm_oom_window_start = now
+    _rmm_oom_count += 1
+
+    _log = logging.getLogger(__name__)
+    if _rmm_oom_count == 1:
+        _log.warning(f"RMM pool exhausted (requested {nbytes:,} B) — flushing caches and retrying")
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return True
+    if _rmm_oom_count <= 3:
+        return True  # retry without re-flushing — nothing new to free
+    _log.error(f"RMM pool exhausted (requested {nbytes:,} B) — {_rmm_oom_count} failures in 10s, raising")
+    return False  # propagate the exception so the stage can recover
 
 try:
     _rmm_max_gb = float(os.environ.get("RMM_POOL_MAX_GB", "3"))
@@ -1019,10 +1033,13 @@ class StringTritonInferenceStage(SinglePortStage):
 def run_inference_pipeline():
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR, exist_ok=True)
     os.environ["MLFLOW_TRACKING_URI"] = f"file://{MODEL_DIR}"
+    # Health server must start first so K8s startup probes get responses
+    # during the entire warm-up and CUDA init window.
+    threading.Thread(target=run_health_server, daemon=True).start()
+    pytime.sleep(1)  # give uvicorn a moment to bind before probes can fire
     warm_up_model_cache()
     threading.Thread(target=memory_manager_worker, daemon=True).start()
     threading.Thread(target=model_janitor_worker, daemon=True).start()
-    threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=control_worker, daemon=True).start()
     while True:
         try:

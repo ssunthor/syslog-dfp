@@ -55,10 +55,10 @@ services:
       TRITON_SERVER_URL: localhost:8003
       MLFLOW_TRACKING_URI: file:///app/models/dfp-models
       # H100 80GB multi-instance memory budget.
-      # 5 pipelines: RMM_POOL_MAX_GB=5  PYTORCH_MEMORY_FRACTION=0.09  (~12 GB/instance, ~64 GB total)
-      # 3 pipelines: RMM_POOL_MAX_GB=8  PYTORCH_MEMORY_FRACTION=0.15  (~20 GB/instance, ~64 GB total)
-      RMM_POOL_MAX_GB: "5"
-      PYTORCH_MEMORY_FRACTION: "0.09"
+      # 5 pipelines: RMM_POOL_MAX_GB=8  PYTORCH_MEMORY_FRACTION=0.06  (~13 GB/instance, ~68 GB total)
+      # 3 pipelines: RMM_POOL_MAX_GB=10 PYTORCH_MEMORY_FRACTION=0.10  (~18 GB/instance, ~62 GB total)
+      RMM_POOL_MAX_GB: "8"
+      PYTORCH_MEMORY_FRACTION: "0.06"
     volumes:
       - ./morpheus_app.py:/app/morpheus_app.py
       - ./dfp-models:/app/models/dfp-models
