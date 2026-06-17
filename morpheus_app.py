@@ -18,6 +18,7 @@ import json
 import psutil
 from datetime import datetime, timedelta
 import rmm
+import rmm.mr as rmm_mr
 from confluent_kafka import Producer, Consumer, KafkaError
 
 # --- CUDA / ML ---
@@ -26,15 +27,32 @@ import cupy as cp
 import torch
 import mlflow
 
-# Initialize RMM with a fixed pool to prevent it from growing indefinitely
+# Initialize RMM with a fixed pool + failure callback so OOM attempts cache
+# flushes and retries before raising, rather than crashing the pipeline.
+def _rmm_oom_handler(nbytes, nothrow):
+    logging.getLogger(__name__).warning(
+        f"RMM pool exhausted (requested {nbytes:,} B) — flushing caches and retrying"
+    )
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        cp.get_default_memory_pool().free_all_blocks()
+        return True  # signal RMM to retry the allocation
+    except Exception:
+        return False
+
 try:
-    rmm.reinitialize(
-        pool_allocator=True,
-        initial_pool_size=1 * 1024 * 1024 * 1024, # 1GB
-        maximum_pool_size=3 * 1024 * 1024 * 1024  # 3GB
+    _pool_mr = rmm_mr.PoolMemoryResource(
+        rmm_mr.CudaMemoryResource(),
+        initial_pool_size=1 * 1024 ** 3,
+        maximum_pool_size=3 * 1024 ** 3,
+    )
+    rmm_mr.set_current_device_resource(
+        rmm_mr.FailureCallbackResourceAdaptor(_pool_mr, _rmm_oom_handler)
     )
     if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.3, 0) # Max 30% of GPU 0
+        torch.cuda.set_per_process_memory_fraction(0.3, 0)
 except Exception as e:
     print(f"⚠️ Memory Initialization Warning: {e}")
 
@@ -301,7 +319,16 @@ def warm_up_model_cache():
 def memory_manager_worker():
     while True:
         try:
-            if psutil.virtual_memory().percent > 60:
+            cpu_pct = psutil.virtual_memory().percent
+            gpu_pct = 0.0
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info(0)
+                gpu_pct = (1.0 - free / total) * 100.0
+            if cpu_pct > 60 or gpu_pct > 70:
+                if gpu_pct > 70:
+                    logging.getLogger(__name__).warning(
+                        f"GPU memory pressure: {gpu_pct:.1f}% used — freeing caches"
+                    )
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
                 cp.get_default_memory_pool().free_all_blocks()
