@@ -28,7 +28,8 @@ services:
       - --load-model=priority_vectorizer
       - --load-model=priority_model
       - --load-model=cyber_log_pipeline
-      - --backend-config=default:memory_pool_byte_size=2147483648
+      # H100 80GB: 4 GB for Triton (shared across all pipeline instances)
+      - --backend-config=default:memory_pool_byte_size=4294967296
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
       interval: 5s
@@ -53,6 +54,11 @@ services:
       OUTPUT_TOPIC: gtt-demo-syslog-output
       TRITON_SERVER_URL: localhost:8003
       MLFLOW_TRACKING_URI: file:///app/models/dfp-models
+      # H100 80GB multi-instance memory budget.
+      # 5 pipelines: RMM_POOL_MAX_GB=5  PYTORCH_MEMORY_FRACTION=0.09  (~12 GB/instance, ~64 GB total)
+      # 3 pipelines: RMM_POOL_MAX_GB=8  PYTORCH_MEMORY_FRACTION=0.15  (~20 GB/instance, ~64 GB total)
+      RMM_POOL_MAX_GB: "5"
+      PYTORCH_MEMORY_FRACTION: "0.09"
     volumes:
       - ./morpheus_app.py:/app/morpheus_app.py
       - ./dfp-models:/app/models/dfp-models

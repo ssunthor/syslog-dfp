@@ -43,16 +43,19 @@ def _rmm_oom_handler(nbytes, nothrow):
         return False
 
 try:
+    _rmm_max_gb = float(os.environ.get("RMM_POOL_MAX_GB", "3"))
+    _rmm_init_gb = min(1.0, _rmm_max_gb)
     _pool_mr = rmm_mr.PoolMemoryResource(
         rmm_mr.CudaMemoryResource(),
-        initial_pool_size=1 * 1024 ** 3,
-        maximum_pool_size=3 * 1024 ** 3,
+        initial_pool_size=int(_rmm_init_gb * 1024 ** 3),
+        maximum_pool_size=int(_rmm_max_gb * 1024 ** 3),
     )
     rmm_mr.set_current_device_resource(
         rmm_mr.FailureCallbackResourceAdaptor(_pool_mr, _rmm_oom_handler)
     )
     if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.3, 0)
+        _pt_fraction = float(os.environ.get("PYTORCH_MEMORY_FRACTION", "0.3"))
+        torch.cuda.set_per_process_memory_fraction(_pt_fraction, 0)
 except Exception as e:
     print(f"⚠️ Memory Initialization Warning: {e}")
 
