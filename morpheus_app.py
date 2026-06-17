@@ -1035,19 +1035,7 @@ def run_inference_pipeline():
 
             pipeline = LinearPipeline(config)
             # CONSISTENT GROUP ID: Allows multi-pod scaling across partitions
-            pipeline.set_source(KafkaSource(
-                config,
-                bootstrap_servers=KAFKA_BROKER,
-                input_topic=INPUT_TOPIC,
-                group_id=KAFKA_GROUP_ID,
-                auto_offset_reset="latest",
-                kafka_consumer_params={
-                    "session.timeout.ms": "30000",
-                    "request.timeout.ms": "60000",
-                    # Must exceed the longest possible batch processing window
-                    "max.poll.interval.ms": "300000",
-                },
-            ))
+            pipeline.set_source(KafkaSource(config, bootstrap_servers=KAFKA_BROKER, input_topic=INPUT_TOPIC, group_id=KAFKA_GROUP_ID, auto_offset_reset="latest"))
             
             pipeline.add_stage(DeserializeStage(config))
             
