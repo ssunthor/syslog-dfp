@@ -29,7 +29,7 @@ import mlflow
 
 # Initialize RMM with a fixed pool + failure callback so OOM attempts cache
 # flushes and retries before raising, rather than crashing the pipeline.
-def _rmm_oom_handler(nbytes, nothrow):
+def _rmm_oom_handler(nbytes, nothrow=False):
     logging.getLogger(__name__).warning(
         f"RMM pool exhausted (requested {nbytes:,} B) — flushing caches and retrying"
     )
