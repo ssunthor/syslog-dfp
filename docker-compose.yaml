@@ -54,11 +54,10 @@ services:
       OUTPUT_TOPIC: gtt-demo-syslog-output
       TRITON_SERVER_URL: localhost:8003
       MLFLOW_TRACKING_URI: file:///app/models/dfp-models
-      # H100 80GB multi-instance memory budget.
-      # 5 pipelines: RMM_POOL_MAX_GB=8  PYTORCH_MEMORY_FRACTION=0.06  (~13 GB/instance, ~68 GB total)
-      # 3 pipelines: RMM_POOL_MAX_GB=10 PYTORCH_MEMORY_FRACTION=0.10  (~18 GB/instance, ~62 GB total)
-      RMM_POOL_MAX_GB: "8"
-      PYTORCH_MEMORY_FRACTION: "0.06"
+      # H100 80GB: 4 syslog-dfp + 2 netflow-dfp pods = 6 total (~68 GB)
+      # syslog-dfp gets more headroom due to large batch sizes (pipeline_batch_size=32768)
+      RMM_POOL_MAX_GB: "7"
+      PYTORCH_MEMORY_FRACTION: "0.05"
     volumes:
       - ./morpheus_app.py:/app/morpheus_app.py
       - ./dfp-models:/app/models/dfp-models

@@ -257,7 +257,10 @@ def control_worker():
     conf = {
         'bootstrap.servers': broker,
         'group.id': pod_id,
-        'auto.offset.reset': 'latest'
+        'auto.offset.reset': 'latest',
+        # Control worker can be starved of CPU during heavy GPU batch processing;
+        # raise the interval so it doesn't get kicked from the group under load.
+        'max.poll.interval.ms': '1800000',  # 30 minutes
     }
     
     consumer = Consumer(conf)
