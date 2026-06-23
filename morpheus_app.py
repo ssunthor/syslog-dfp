@@ -32,8 +32,8 @@ import mlflow
 _rmm_oom_count = 0
 _rmm_oom_window_start = 0.0
 
-kafka_batch_size = os.getenv("KAFKA_BATCH_SIZE", "1024")
-kafka_edge_buffer = os.getenv("KAFKA_EDGE_BUFFER", "128")
+kafka_batch_size = os.getenv("KAFKA_BATCH_SIZE", 1024)
+kafka_edge_buffer = os.getenv("KAFKA_EDGE_BUFFER", 128)
 
 def _rmm_oom_handler(nbytes, nothrow=False):
     global _rmm_oom_count, _rmm_oom_window_start
