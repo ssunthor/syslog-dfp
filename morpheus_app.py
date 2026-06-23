@@ -33,6 +33,7 @@ _rmm_oom_count = 0
 _rmm_oom_window_start = 0.0
 
 kafka_batch_size = os.getenv("KAFKA_BATCH_SIZE", "1024")
+kafka_edge_buffer = os.getenv("KAFKA_EDGE_BUFFER", "128")
 
 def _rmm_oom_handler(nbytes, nothrow=False):
     global _rmm_oom_count, _rmm_oom_window_start
@@ -1048,7 +1049,7 @@ def run_inference_pipeline():
     threading.Thread(target=control_worker, daemon=True).start()
     while True:
         try:
-            config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = kafka_batch_size; config.edge_buffer_size = 32768; config.mode = "AE"; config.num_threads = 8
+            config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = kafka_batch_size; config.edge_buffer_size = kafka_edge_buffer; config.mode = "AE"; config.num_threads = 8
             KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
             KAFKA_GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "morpheus_syslog_dfp_v1")
             INPUT_TOPIC = os.environ.get("INPUT_TOPIC", "kafka_input")
