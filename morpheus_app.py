@@ -883,7 +883,7 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
     def name(self): return "threat-pattern"
     def accepted_types(self): return (MessageMeta,)
     def supports_cpp_node(self): return False
-    def compute_schema(self, schema): return schema
+    def compute_schema(self, schema): schema.output_schema.set_type(MessageMeta); return schema
 
     @staticmethod
     def _define_patterns():
