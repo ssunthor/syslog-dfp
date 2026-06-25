@@ -264,6 +264,55 @@ def _baseline_errors(batch_size: int = 200) -> torch.Tensor:
 
 @pytest.mark.torch
 @requires_torch
+class TestFeatureWeightedScoring:
+    """Verify that time features are down-weighted in the anomaly score."""
+
+    def test_time_weights_are_025(self):
+        for i in [4, 5, 6, 7]:
+            assert _FEATURE_WEIGHTS[i] == 0.25
+
+    def test_non_time_weights_are_1(self):
+        for i in range(NUM_FEATURES):
+            if i not in [4, 5, 6, 7]:
+                assert _FEATURE_WEIGHTS[i] == 1.0
+
+    def test_time_only_errors_produce_lower_score(self):
+        """When only time features have error, weighted score should be
+        much lower than unweighted."""
+        errors = torch.zeros(50, NUM_FEATURES)
+        errors[:, 4] = 2.0  # hour_sin
+        errors[:, 5] = 2.0  # hour_cos
+        weights = torch.tensor(_FEATURE_WEIGHTS, dtype=torch.float32)
+
+        unweighted_mean = torch.mean(errors, dim=1)
+        weighted_mean = torch.mean(errors * weights, dim=1)
+        assert float(weighted_mean[0]) < float(unweighted_mean[0]) * 0.5
+
+    def test_non_time_errors_unaffected(self):
+        """Errors on non-time features should produce the same score
+        whether weighted or not."""
+        errors = torch.zeros(50, NUM_FEATURES)
+        errors[:, 0] = 2.0   # log_count
+        errors[:, 10] = 2.0  # proc_hash
+        weights = torch.tensor(_FEATURE_WEIGHTS, dtype=torch.float32)
+
+        unweighted_mean = torch.mean(errors, dim=1)
+        weighted_mean = torch.mean(errors * weights, dim=1)
+        assert float(weighted_mean[0]) == pytest.approx(float(unweighted_mean[0]))
+
+    def test_mixed_errors_time_contributes_less(self):
+        """With equal errors across all features, weighted score should be
+        lower than unweighted due to time feature damping."""
+        errors = torch.ones(50, NUM_FEATURES) * 1.0
+        weights = torch.tensor(_FEATURE_WEIGHTS, dtype=torch.float32)
+
+        unweighted_mean = float(torch.mean(errors, dim=1)[0])
+        weighted_mean = float(torch.mean(errors * weights, dim=1)[0])
+        assert weighted_mean < unweighted_mean
+
+
+@pytest.mark.torch
+@requires_torch
 class TestReasonAttribution:
     """Verify that relative-error reason attribution correctly identifies every
     feature as the anomaly cause when that feature has an outlier error."""
@@ -421,22 +470,34 @@ def _train_autoencoder(model, data: np.ndarray, epochs: int = 30):
     model.eval()
 
 
+# Feature weights matching ManualInferenceStage.FEATURE_WEIGHTS
+_FEATURE_WEIGHTS = [1.0] * NUM_FEATURES
+_FEATURE_WEIGHTS[4] = 0.25  # hour_sin
+_FEATURE_WEIGHTS[5] = 0.25  # hour_cos
+_FEATURE_WEIGHTS[6] = 0.25  # day_sin
+_FEATURE_WEIGHTS[7] = 0.25  # day_cos
+
+
 def _run_inference(model, data: np.ndarray):
     """Run the full ManualInferenceStage scoring + reason attribution on CPU.
-    Returns (scores, reason_labels) matching production logic."""
+    Returns (scores, reason_labels, raw_abs_errors) matching production logic."""
     means = model.saved_means.numpy()
     stds = model.saved_scales.numpy()
     normalized = (data - means) / stds
     input_t = torch.tensor(normalized, dtype=torch.float32)
+    weights = torch.tensor(_FEATURE_WEIGHTS, dtype=torch.float32)
 
     with torch.no_grad():
         reconstruction = model(input_t)
         abs_errors = torch.abs(input_t - reconstruction)
-        max_err = torch.max(abs_errors, dim=1).values
-        mean_err = torch.mean(abs_errors, dim=1)
+
+        # Weighted scoring (time features down-weighted)
+        weighted_errors = abs_errors * weights
+        max_err = torch.max(weighted_errors, dim=1).values
+        mean_err = torch.mean(weighted_errors, dim=1)
         loss = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
 
-        # Relative reason attribution (matches production code)
+        # Reason attribution uses unweighted errors
         feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
         feat_iqr = (
             torch.quantile(abs_errors, 0.75, dim=0)

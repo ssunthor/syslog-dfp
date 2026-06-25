@@ -708,9 +708,20 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
 
 @register_stage("manual-inference")
 class ManualInferenceStage(SinglePortStage):
+    # Per-feature weights for scoring. Time features (indices 4-7) are down-weighted
+    # because sin/cos cyclical encoding produces inherently high reconstruction error
+    # that doesn't reflect anomalous host behavior — the autoencoder can't predict the
+    # clock. Time-based anomalies are handled at a higher level by ThreatPatternStage.
+    FEATURE_WEIGHTS = [1.0] * NUM_FEATURES
+    FEATURE_WEIGHTS[4] = 0.25  # hour_sin
+    FEATURE_WEIGHTS[5] = 0.25  # hour_cos
+    FEATURE_WEIGHTS[6] = 0.25  # day_sin
+    FEATURE_WEIGHTS[7] = 0.25  # day_cos
+
     def __init__(self, c):
-        super().__init__(c); self._debug_counter = 0; self._gc_anchor = collections.deque(maxlen=5) 
-        self._last_reload = pytime.time(); self._min_reload_cooldown = 120.0 
+        super().__init__(c); self._debug_counter = 0; self._gc_anchor = collections.deque(maxlen=5)
+        self._last_reload = pytime.time(); self._min_reload_cooldown = 120.0
+        self._feature_weights = torch.tensor(self.FEATURE_WEIGHTS, device="cuda", dtype=torch.float32)
         self._build_gpu_lookups()
     def _build_gpu_lookups(self):
         logger.info(f"⏳ RELOAD: Syncing GPU from Global Cache...")
@@ -786,8 +797,13 @@ class ManualInferenceStage(SinglePortStage):
             
             with torch.no_grad():
                 abs_errors = torch.abs(normalized_input - reconstruction)
-                max_err = torch.max(abs_errors, dim=1).values
-                mean_err = torch.mean(abs_errors, dim=1)
+
+                # Apply feature weights to scoring so time features don't inflate scores.
+                # Reason attribution uses unweighted errors (below) so time anomalies
+                # can still be identified when genuinely unusual.
+                weighted_errors = abs_errors * self._feature_weights
+                max_err = torch.max(weighted_errors, dim=1).values
+                mean_err = torch.mean(weighted_errors, dim=1)
 
                 # BLENDED LOSS (0.7 MAE + 0.3 MAX): Captures both general drift and extreme spikes
                 loss_f32 = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
