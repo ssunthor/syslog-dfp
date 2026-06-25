@@ -887,78 +887,99 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
 
     @staticmethod
     def _define_patterns():
-        """Pattern definitions. Each returns (label, description) or None."""
+        """Pattern definitions. Each returns (label, description, confidence) or None.
+        Confidence is 0.0–1.0 based on how far the signal exceeds the threshold."""
         patterns = []
 
         def brute_force(reasons, _scores, n):
             sec_count = reasons.get("Security Flag", 0)
-            if sec_count >= 5 and sec_count / max(n, 1) > 0.3:
+            ratio = sec_count / max(n, 1)
+            if sec_count >= 5 and ratio > 0.3:
+                conf = min(1.0, 0.4 + (sec_count - 5) * 0.06 + (ratio - 0.3) * 1.0)
                 return ("Brute Force Attack",
-                        f"{sec_count} security events in window — repeated authentication failures indicate credential stuffing or brute force")
+                        f"{sec_count} security events in window — repeated authentication failures indicate credential stuffing or brute force",
+                        round(conf, 2))
             return None
         patterns.append(brute_force)
 
         def lateral_movement(reasons, _scores, _n):
-            has_user = reasons.get("User Anomaly", 0) >= 2
-            has_time = reasons.get("Time Anomaly (Hour)", 0) >= 1
-            has_sec = reasons.get("Security Flag", 0) >= 1
-            if has_user and (has_time or has_sec):
+            user_count = reasons.get("User Anomaly", 0)
+            time_count = reasons.get("Time Anomaly (Hour)", 0)
+            sec_count = reasons.get("Security Flag", 0)
+            if user_count >= 2 and (time_count >= 1 or sec_count >= 1):
+                signals = min(user_count, 5) + min(time_count, 3) + min(sec_count, 3)
+                conf = min(1.0, 0.3 + signals * 0.07)
                 return ("Lateral Movement",
-                        "New user accounts active at unusual hours with security events — possible attacker pivoting through the network")
+                        "New user accounts active at unusual hours with security events — possible attacker pivoting through the network",
+                        round(conf, 2))
             return None
         patterns.append(lateral_movement)
 
         def service_install(reasons, _scores, _n):
-            has_proc = reasons.get("Process Anomaly", 0) >= 2
-            has_content = reasons.get("Log Content Anomaly", 0) >= 3
-            has_volume = reasons.get("Volume Anomaly", 0) >= 1
-            if has_proc and (has_content or has_volume):
+            proc_count = reasons.get("Process Anomaly", 0)
+            content_count = reasons.get("Log Content Anomaly", 0)
+            volume_count = reasons.get("Volume Anomaly", 0)
+            if proc_count >= 2 and (content_count >= 3 or volume_count >= 1):
+                signals = min(proc_count, 6) + min(content_count, 8) + min(volume_count, 4)
+                conf = min(1.0, 0.3 + signals * 0.05)
                 return ("New Service Detected",
-                        "New processes generating unfamiliar log patterns with volume changes — a new service or application has been installed")
+                        "New processes generating unfamiliar log patterns with volume changes — a new service or application has been installed",
+                        round(conf, 2))
             return None
         patterns.append(service_install)
 
         def data_exfiltration(reasons, scores, _n):
-            has_volume = reasons.get("Volume Anomaly", 0) >= 3
+            vol_count = reasons.get("Volume Anomaly", 0)
             high_scores = sum(1 for s in scores if s > 6.0)
-            if has_volume and high_scores >= 3:
+            if vol_count >= 3 and high_scores >= 3:
+                conf = min(1.0, 0.4 + (vol_count - 3) * 0.08 + (high_scores - 3) * 0.08)
                 return ("Possible Data Exfiltration",
-                        f"Sustained volume spikes with {high_scores} critical-severity scores — abnormal data transfer pattern")
+                        f"Sustained volume spikes with {high_scores} critical-severity scores — abnormal data transfer pattern",
+                        round(conf, 2))
             return None
         patterns.append(data_exfiltration)
 
         def privilege_escalation(reasons, scores, _n):
-            has_user = reasons.get("User Anomaly", 0) >= 1
-            has_sec = reasons.get("Security Flag", 0) >= 2
+            user_count = reasons.get("User Anomaly", 0)
+            sec_count = reasons.get("Security Flag", 0)
             high_scores = sum(1 for s in scores if s > 7.0)
-            if has_user and has_sec and high_scores >= 2:
+            if user_count >= 1 and sec_count >= 2 and high_scores >= 2:
+                conf = min(1.0, 0.5 + (sec_count - 2) * 0.1 + (high_scores - 2) * 0.1)
                 return ("Privilege Escalation Attempt",
-                        "Unknown users triggering high-severity security events — possible privilege escalation or unauthorized access")
+                        "Unknown users triggering high-severity security events — possible privilege escalation or unauthorized access",
+                        round(conf, 2))
             return None
         patterns.append(privilege_escalation)
 
         def crypto_mining(reasons, _scores, _n):
-            has_proc = reasons.get("Process Anomaly", 0) >= 2
-            has_volume = reasons.get("Volume Anomaly", 0) >= 2
-            if has_proc and has_volume and not reasons.get("Security Flag", 0):
+            proc_count = reasons.get("Process Anomaly", 0)
+            vol_count = reasons.get("Volume Anomaly", 0)
+            if proc_count >= 2 and vol_count >= 2 and not reasons.get("Security Flag", 0):
+                conf = min(1.0, 0.3 + (proc_count - 2) * 0.1 + (vol_count - 2) * 0.1)
                 return ("Suspicious Process Activity",
-                        "New high-volume processes without security flags — possible crypto miner, unauthorized daemon, or resource hijacking")
+                        "New high-volume processes without security flags — possible crypto miner, unauthorized daemon, or resource hijacking",
+                        round(conf, 2))
             return None
         patterns.append(crypto_mining)
 
         def behavioral_drift(reasons, _scores, n):
             distinct = sum(1 for v in reasons.values() if v >= 2)
             if distinct >= 4 and n >= 10:
+                conf = min(1.0, 0.4 + (distinct - 4) * 0.15 + (n - 10) * 0.01)
                 return ("Major Behavioral Shift",
-                        f"{distinct} distinct anomaly categories active — host behavior has fundamentally changed from its learned baseline")
+                        f"{distinct} distinct anomaly categories active — host behavior has fundamentally changed from its learned baseline",
+                        round(conf, 2))
             return None
         patterns.append(behavioral_drift)
 
         def time_anomaly_sustained(reasons, _scores, n):
             time_count = reasons.get("Time Anomaly (Hour)", 0) + reasons.get("Time Anomaly (Day)", 0)
-            if time_count >= 5 and time_count / max(n, 1) > 0.5:
+            ratio = time_count / max(n, 1)
+            if time_count >= 5 and ratio > 0.5:
+                conf = min(1.0, 0.3 + (time_count - 5) * 0.05 + (ratio - 0.5) * 1.0)
                 return ("Off-Hours Activity",
-                        f"{time_count}/{n} events at unusual times — this host is active outside its normal operating schedule")
+                        f"{time_count}/{n} events at unusual times — this host is active outside its normal operating schedule",
+                        round(conf, 2))
             return None
         patterns.append(time_anomaly_sustained)
 
@@ -968,7 +989,7 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
         """Evaluate all patterns for a host and return the best match."""
         window = self._windows.get(source)
         if not window:
-            return None, None
+            return None, None, 0.0
 
         # Prune old entries
         cutoff = now - self.WINDOW_SECONDS
@@ -976,13 +997,12 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
             window.popleft()
 
         if len(window) < 3:
-            return None, None
+            return None, None, 0.0
 
         reasons = collections.Counter(entry[2] for entry in window)
         scores = [entry[1] for entry in window]
         n = len(window)
 
-        # Evaluate all patterns, pick the one with the highest implied severity
         matches = []
         for pattern_fn in self.PATTERNS:
             result = pattern_fn(reasons, scores, n)
@@ -990,10 +1010,11 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
                 matches.append(result)
 
         if not matches:
-            return None, None
+            return None, None, 0.0
 
-        # Return the first match (patterns are ordered by severity)
-        return matches[0]
+        # Pick the highest-confidence match
+        best = max(matches, key=lambda m: m[2])
+        return best
 
     def _process(self, msg: MessageMeta):
         if msg is None:
@@ -1020,18 +1041,21 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
                 # Evaluate patterns for each unique source in this batch
                 context_labels = []
                 context_descriptions = []
+                context_confidences = []
                 unique_sources = {}
                 for src in set(sources):
-                    label, desc = self._evaluate_host(str(src), now)
-                    unique_sources[str(src)] = (label or "", desc or "")
+                    label, desc, conf = self._evaluate_host(str(src), now)
+                    unique_sources[str(src)] = (label or "", desc or "", conf)
 
                 for src in sources:
-                    pair = unique_sources.get(str(src), ("", ""))
-                    context_labels.append(pair[0])
-                    context_descriptions.append(pair[1])
+                    entry = unique_sources.get(str(src), ("", "", 0.0))
+                    context_labels.append(entry[0])
+                    context_descriptions.append(entry[1])
+                    context_confidences.append(entry[2])
 
                 df["threat_context"] = context_labels
                 df["threat_description"] = context_descriptions
+                df["threat_confidence"] = context_confidences
 
         except Exception as e:
             logger.error(f"ThreatPattern Error: {e}")
