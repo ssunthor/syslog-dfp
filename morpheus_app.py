@@ -708,15 +708,15 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
 
 @register_stage("manual-inference")
 class ManualInferenceStage(SinglePortStage):
-    # Per-feature weights for scoring. Time features (indices 4-7) are down-weighted
-    # because sin/cos cyclical encoding produces inherently high reconstruction error
-    # that doesn't reflect anomalous host behavior — the autoencoder can't predict the
-    # clock. Time-based anomalies are handled at a higher level by ThreatPatternStage.
+    # Time features (indices 4-7) are excluded from scoring and reason attribution.
+    # The autoencoder cannot learn to reconstruct sin/cos time encoding — it trains
+    # on logs from many hours so it learns the mean, which is wrong for every specific
+    # hour. Time features stay in the training vector (the bottleneck still captures
+    # time-correlated behavior) but contribute zero to scores and reasons.
+    TIME_FEATURE_INDICES = {4, 5, 6, 7}
     FEATURE_WEIGHTS = [1.0] * NUM_FEATURES
-    FEATURE_WEIGHTS[4] = 0.25  # hour_sin
-    FEATURE_WEIGHTS[5] = 0.25  # hour_cos
-    FEATURE_WEIGHTS[6] = 0.25  # day_sin
-    FEATURE_WEIGHTS[7] = 0.25  # day_cos
+    for _ti in TIME_FEATURE_INDICES:
+        FEATURE_WEIGHTS[_ti] = 0.0
 
     def __init__(self, c):
         super().__init__(c); self._debug_counter = 0; self._gc_anchor = collections.deque(maxlen=5)
@@ -798,9 +798,7 @@ class ManualInferenceStage(SinglePortStage):
             with torch.no_grad():
                 abs_errors = torch.abs(normalized_input - reconstruction)
 
-                # Apply feature weights to scoring so time features don't inflate scores.
-                # Reason attribution uses unweighted errors (below) so time anomalies
-                # can still be identified when genuinely unusual.
+                # Exclude time features from both scoring and reason attribution.
                 weighted_errors = abs_errors * self._feature_weights
                 max_err = torch.max(weighted_errors, dim=1).values
                 mean_err = torch.mean(weighted_errors, dim=1)
@@ -808,14 +806,15 @@ class ManualInferenceStage(SinglePortStage):
                 # BLENDED LOSS (0.7 MAE + 0.3 MAX): Captures both general drift and extreme spikes
                 loss_f32 = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
 
-                # RELATIVE REASON ATTRIBUTION: Raw argmax always picks time features
-                # because sin/cos cyclical encoding has inherently high reconstruction
-                # error (autoencoder can't enforce sin²+cos²=1). Normalize each
-                # feature's error by its batch baseline so the reason reflects which
-                # feature is most *unusual*, not just highest raw error.
+                # REASON ATTRIBUTION: Use relative error on non-time features only.
+                # Time features are masked to -inf so they can never be selected.
                 feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
                 feat_iqr = (torch.quantile(abs_errors, 0.75, dim=0) - torch.quantile(abs_errors, 0.25, dim=0)).unsqueeze(0).clamp(min=0.01)
                 relative_errors = (abs_errors - feat_median) / feat_iqr
+                relative_errors[:, 4] = float('-inf')
+                relative_errors[:, 5] = float('-inf')
+                relative_errors[:, 6] = float('-inf')
+                relative_errors[:, 7] = float('-inf')
                 _, reason_indices = torch.max(relative_errors, dim=1)
                 reason_codes = reason_indices.cpu().numpy()
             
@@ -920,13 +919,13 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
 
         def lateral_movement(reasons, _scores, _n):
             user_count = reasons.get("User Anomaly", 0)
-            time_count = reasons.get("Time Anomaly (Hour)", 0)
             sec_count = reasons.get("Security Flag", 0)
-            if user_count >= 2 and (time_count >= 1 or sec_count >= 1):
-                signals = min(user_count, 5) + min(time_count, 3) + min(sec_count, 3)
+            proc_count = reasons.get("Process Anomaly", 0)
+            if user_count >= 2 and (sec_count >= 1 or proc_count >= 1):
+                signals = min(user_count, 5) + min(sec_count, 3) + min(proc_count, 3)
                 conf = min(1.0, 0.3 + signals * 0.07)
                 return ("Lateral Movement",
-                        "New user accounts active at unusual hours with security events — possible attacker pivoting through the network",
+                        "New user accounts with security events or unfamiliar processes — possible attacker pivoting through the network",
                         round(conf, 2))
             return None
         patterns.append(lateral_movement)
@@ -987,17 +986,6 @@ class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
                         round(conf, 2))
             return None
         patterns.append(behavioral_drift)
-
-        def time_anomaly_sustained(reasons, _scores, n):
-            time_count = reasons.get("Time Anomaly (Hour)", 0) + reasons.get("Time Anomaly (Day)", 0)
-            ratio = time_count / max(n, 1)
-            if time_count >= 5 and ratio > 0.5:
-                conf = min(1.0, 0.3 + (time_count - 5) * 0.05 + (ratio - 0.5) * 1.0)
-                return ("Off-Hours Activity",
-                        f"{time_count}/{n} events at unusual times — this host is active outside its normal operating schedule",
-                        round(conf, 2))
-            return None
-        patterns.append(time_anomaly_sustained)
 
         return patterns
 

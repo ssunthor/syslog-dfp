@@ -239,23 +239,27 @@ for _ri in range(11, NUM_FEATURES):
 
 
 def attribute_reason(abs_errors: torch.Tensor) -> np.ndarray:
-    """Replica of ManualInferenceStage relative-error reason attribution."""
+    """Replica of ManualInferenceStage relative-error reason attribution.
+    Time features (indices 4-7) are masked to -inf so they can never be selected."""
     feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
     feat_iqr = (
         torch.quantile(abs_errors, 0.75, dim=0)
         - torch.quantile(abs_errors, 0.25, dim=0)
     ).unsqueeze(0).clamp(min=0.01)
     relative_errors = (abs_errors - feat_median) / feat_iqr
+    relative_errors[:, 4] = float('-inf')
+    relative_errors[:, 5] = float('-inf')
+    relative_errors[:, 6] = float('-inf')
+    relative_errors[:, 7] = float('-inf')
     _, reason_indices = torch.max(relative_errors, dim=1)
     return reason_indices.numpy()
 
 
 def _baseline_errors(batch_size: int = 200) -> torch.Tensor:
     """Generate realistic baseline reconstruction errors: time features have
-    higher raw error (the exact problem the relative attribution fixes)."""
+    higher raw error but are excluded from scoring and reason attribution."""
     errors = torch.rand(batch_size, NUM_FEATURES) * 0.3
-    # Simulate the autoencoder's inherently higher error on cyclical features
-    errors[:, 4] += 0.8  # hour_sin
+    errors[:, 4] += 0.8  # hour_sin (excluded from scoring/reasons)
     errors[:, 5] += 0.7  # hour_cos
     errors[:, 6] += 0.5  # day_sin
     errors[:, 7] += 0.5  # day_cos
@@ -267,26 +271,24 @@ def _baseline_errors(batch_size: int = 200) -> torch.Tensor:
 class TestFeatureWeightedScoring:
     """Verify that time features are down-weighted in the anomaly score."""
 
-    def test_time_weights_are_025(self):
+    def test_time_weights_are_zero(self):
         for i in [4, 5, 6, 7]:
-            assert _FEATURE_WEIGHTS[i] == 0.25
+            assert _FEATURE_WEIGHTS[i] == 0.0
 
     def test_non_time_weights_are_1(self):
         for i in range(NUM_FEATURES):
             if i not in [4, 5, 6, 7]:
                 assert _FEATURE_WEIGHTS[i] == 1.0
 
-    def test_time_only_errors_produce_lower_score(self):
-        """When only time features have error, weighted score should be
-        much lower than unweighted."""
+    def test_time_only_errors_produce_zero_score(self):
+        """When only time features have error, weighted score should be zero."""
         errors = torch.zeros(50, NUM_FEATURES)
         errors[:, 4] = 2.0  # hour_sin
         errors[:, 5] = 2.0  # hour_cos
         weights = torch.tensor(_FEATURE_WEIGHTS, dtype=torch.float32)
 
-        unweighted_mean = torch.mean(errors, dim=1)
         weighted_mean = torch.mean(errors * weights, dim=1)
-        assert float(weighted_mean[0]) < float(unweighted_mean[0]) * 0.5
+        assert float(weighted_mean[0]) == pytest.approx(0.0)
 
     def test_non_time_errors_unaffected(self):
         """Errors on non-time features should produce the same score
@@ -317,19 +319,26 @@ class TestReasonAttribution:
     """Verify that relative-error reason attribution correctly identifies every
     feature as the anomaly cause when that feature has an outlier error."""
 
-    @pytest.mark.parametrize("feature_idx", range(NUM_FEATURES))
+    @pytest.mark.parametrize("feature_idx", [i for i in range(NUM_FEATURES) if i not in (4, 5, 6, 7)])
     def test_spiked_feature_is_selected(self, feature_idx):
-        """When one feature has a large outlier error in a single row, that row's
-        reason code should point to the spiked feature."""
+        """When one non-time feature has a large outlier error in a single row,
+        that row's reason code should point to the spiked feature."""
         errors = _baseline_errors(200)
         target_row = 42
-        # Inject a spike much larger than anything else in that feature's column
         errors[target_row, feature_idx] += 5.0
         reasons = attribute_reason(errors)
         assert reasons[target_row] == feature_idx, (
             f"Expected feature {feature_idx} ({FEATURE_COLS[feature_idx]}) "
             f"but got {reasons[target_row]} ({FEATURE_COLS[reasons[target_row]]})"
         )
+
+    @pytest.mark.parametrize("feature_idx", [4, 5, 6, 7])
+    def test_time_features_never_selected(self, feature_idx):
+        """Time features are masked to -inf and should never be selected."""
+        errors = _baseline_errors(200)
+        errors[42, feature_idx] += 10.0
+        reasons = attribute_reason(errors)
+        assert reasons[42] not in (4, 5, 6, 7)
 
     @pytest.mark.parametrize("feature_idx", range(NUM_FEATURES))
     def test_reason_maps_to_known_string(self, feature_idx):
@@ -358,16 +367,18 @@ class TestReasonAttribution:
             f"Baseline should cause time dominance, but only {time_count}/500 rows were time"
         )
 
-    def test_each_reason_string_reachable(self):
-        """Every reason string in the map must be reachable by spiking the
+    def test_each_non_time_reason_string_reachable(self):
+        """Every non-time reason string must be reachable by spiking the
         corresponding feature."""
         seen_reasons = set()
         for feature_idx in range(NUM_FEATURES):
+            if feature_idx in (4, 5, 6, 7):
+                continue
             errors = _baseline_errors(100)
             errors[0, feature_idx] += 5.0
             reasons = attribute_reason(errors)
             seen_reasons.add(REASON_MAP[int(reasons[0])])
-        expected = set(REASON_MAP.values())
+        expected = {v for k, v in REASON_MAP.items() if k not in (4, 5, 6, 7)}
         assert seen_reasons == expected, f"Missing: {expected - seen_reasons}"
 
     def test_multiple_spikes_picks_largest(self):
@@ -472,10 +483,11 @@ def _train_autoencoder(model, data: np.ndarray, epochs: int = 30):
 
 # Feature weights matching ManualInferenceStage.FEATURE_WEIGHTS
 _FEATURE_WEIGHTS = [1.0] * NUM_FEATURES
-_FEATURE_WEIGHTS[4] = 0.25  # hour_sin
-_FEATURE_WEIGHTS[5] = 0.25  # hour_cos
-_FEATURE_WEIGHTS[6] = 0.25  # day_sin
-_FEATURE_WEIGHTS[7] = 0.25  # day_cos
+_FEATURE_WEIGHTS[4] = 0.0  # hour_sin — excluded
+_FEATURE_WEIGHTS[5] = 0.0  # hour_cos — excluded
+_FEATURE_WEIGHTS[6] = 0.0  # day_sin — excluded
+_FEATURE_WEIGHTS[7] = 0.0  # day_cos — excluded
+_TIME_INDICES = {4, 5, 6, 7}
 
 
 def _run_inference(model, data: np.ndarray):
@@ -497,13 +509,15 @@ def _run_inference(model, data: np.ndarray):
         mean_err = torch.mean(weighted_errors, dim=1)
         loss = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
 
-        # Reason attribution uses unweighted errors
+        # Reason attribution: mask time features to -inf so they can't be selected
         feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
         feat_iqr = (
             torch.quantile(abs_errors, 0.75, dim=0)
             - torch.quantile(abs_errors, 0.25, dim=0)
         ).unsqueeze(0).clamp(min=0.01)
         relative_errors = (abs_errors - feat_median) / feat_iqr
+        for ti in _TIME_INDICES:
+            relative_errors[:, ti] = float('-inf')
         _, reason_indices = torch.max(relative_errors, dim=1)
 
     scores_np = loss.numpy()
@@ -706,12 +720,10 @@ class TestScenarioLateralMovement:
         _, labels, _ = _run_inference(self.model, self.anomaly_data)
         assert "User Anomaly" in labels, f"User Anomaly not in {set(labels)}"
 
-    def test_security_flag_or_time_anomaly_detected(self):
+    def test_security_flag_detected(self):
         _, labels, _ = _run_inference(self.model, self.anomaly_data)
-        has_security = "Security Flag" in labels
-        has_time = "Time Anomaly (Hour)" in labels
-        assert has_security or has_time, (
-            f"Expected Security Flag or Time Anomaly (Hour), got: {set(labels)}"
+        assert "Security Flag" in labels, (
+            f"Expected Security Flag in: {set(labels)}"
         )
 
     def test_multiple_reasons(self):
@@ -767,10 +779,10 @@ else:
 
     def _p_lateral(reasons, _scores, _n):
         user_count = reasons.get("User Anomaly", 0)
-        time_count = reasons.get("Time Anomaly (Hour)", 0)
         sec_count = reasons.get("Security Flag", 0)
-        if user_count >= 2 and (time_count >= 1 or sec_count >= 1):
-            signals = min(user_count, 5) + min(time_count, 3) + min(sec_count, 3)
+        proc_count = reasons.get("Process Anomaly", 0)
+        if user_count >= 2 and (sec_count >= 1 or proc_count >= 1):
+            signals = min(user_count, 5) + min(sec_count, 3) + min(proc_count, 3)
             conf = min(1.0, 0.3 + signals * 0.07)
             return ("Lateral Movement", "", round(conf, 2))
         return None
@@ -817,15 +829,7 @@ else:
             return ("Major Behavioral Shift", "", round(conf, 2))
         return None
 
-    def _p_offhours(reasons, _scores, n):
-        tc = reasons.get("Time Anomaly (Hour)", 0) + reasons.get("Time Anomaly (Day)", 0)
-        ratio = tc / max(n, 1)
-        if tc >= 5 and ratio > 0.5:
-            conf = min(1.0, 0.3 + (tc - 5) * 0.05 + (ratio - 0.5) * 1.0)
-            return ("Off-Hours Activity", "", round(conf, 2))
-        return None
-
-    _PATTERNS = [_p_brute_force, _p_lateral, _p_service, _p_exfil, _p_privesc, _p_crypto, _p_drift, _p_offhours]
+    _PATTERNS = [_p_brute_force, _p_lateral, _p_service, _p_exfil, _p_privesc, _p_crypto, _p_drift]
 
 
 def _evaluate_patterns(reasons_dict, scores_list):
@@ -866,10 +870,10 @@ class TestThreatPatterns:
         assert "Brute Force Attack" not in _matched_labels(reasons, [5.0] * 3)
 
     def test_lateral_movement_triggers(self):
-        reasons = {"User Anomaly": 3, "Time Anomaly (Hour)": 2, "Security Flag": 1}
-        assert "Lateral Movement" in _matched_labels(reasons, [4.0] * 6)
+        reasons = {"User Anomaly": 3, "Security Flag": 1, "Process Anomaly": 1}
+        assert "Lateral Movement" in _matched_labels(reasons, [4.0] * 5)
 
-    def test_lateral_movement_needs_user_plus_time_or_security(self):
+    def test_lateral_movement_needs_user_plus_security_or_process(self):
         reasons = {"User Anomaly": 3}
         assert "Lateral Movement" not in _matched_labels(reasons, [4.0] * 3)
 
@@ -919,14 +923,6 @@ class TestThreatPatterns:
         }
         assert "Major Behavioral Shift" not in _matched_labels(reasons, [4.0] * 8)
 
-    def test_off_hours_triggers(self):
-        reasons = {"Time Anomaly (Hour)": 8, "Volume Anomaly": 1}
-        assert "Off-Hours Activity" in _matched_labels(reasons, [4.0] * 9)
-
-    def test_off_hours_needs_majority(self):
-        reasons = {"Time Anomaly (Hour)": 3, "Volume Anomaly": 10}
-        assert "Off-Hours Activity" not in _matched_labels(reasons, [4.0] * 13)
-
     def test_normal_traffic_no_patterns(self):
         reasons = {"Volume Anomaly": 1, "Log Content Anomaly": 1}
         assert _evaluate_patterns(reasons, [3.0] * 2) == []
@@ -961,17 +957,16 @@ class TestThreatPatterns:
         expected = {
             "Brute Force Attack", "Lateral Movement", "New Service Detected",
             "Possible Data Exfiltration", "Privilege Escalation Attempt",
-            "Suspicious Process Activity", "Major Behavioral Shift", "Off-Hours Activity",
+            "Suspicious Process Activity", "Major Behavioral Shift",
         }
         scenarios = [
             ({"Security Flag": 8}, [5.0] * 8),
-            ({"User Anomaly": 3, "Time Anomaly (Hour)": 2}, [4.0] * 5),
+            ({"User Anomaly": 3, "Security Flag": 2}, [4.0] * 5),
             ({"Process Anomaly": 3, "Log Content Anomaly": 5}, [4.0] * 8),
             ({"Volume Anomaly": 5}, [7.0] * 5),
             ({"User Anomaly": 2, "Security Flag": 3}, [8.0] * 5),
             ({"Process Anomaly": 4, "Volume Anomaly": 4}, [5.0] * 8),
             ({"Volume Anomaly": 3, "Process Anomaly": 2, "User Anomaly": 2, "Log Content Anomaly": 4}, [4.0] * 11),
-            ({"Time Anomaly (Hour)": 8}, [4.0] * 8),
         ]
         seen = set()
         for reasons, scores in scenarios:
@@ -1003,13 +998,12 @@ class TestThreatPatterns:
     def test_each_pattern_returns_confidence(self):
         scenarios = [
             ({"Security Flag": 8}, [5.0] * 8),
-            ({"User Anomaly": 3, "Time Anomaly (Hour)": 2}, [4.0] * 5),
+            ({"User Anomaly": 3, "Security Flag": 2}, [4.0] * 5),
             ({"Process Anomaly": 3, "Log Content Anomaly": 5}, [4.0] * 8),
             ({"Volume Anomaly": 5}, [7.0] * 5),
             ({"User Anomaly": 2, "Security Flag": 3}, [8.0] * 5),
             ({"Process Anomaly": 4, "Volume Anomaly": 4}, [5.0] * 8),
             ({"Volume Anomaly": 3, "Process Anomaly": 2, "User Anomaly": 2, "Log Content Anomaly": 4}, [4.0] * 11),
-            ({"Time Anomaly (Hour)": 8}, [4.0] * 8),
         ]
         for reasons, scores in scenarios:
             matches = _evaluate_patterns(reasons, scores)
