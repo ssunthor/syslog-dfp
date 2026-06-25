@@ -2,7 +2,10 @@
 syslog-DFP pipeline test suite.
 
 Tier 1 — CPU-only unit tests (no GPU, no Morpheus). Run anywhere with:
-    pytest tests/ -m "not gpu and not morpheus"
+    pytest tests/ -m "not gpu and not morpheus and not torch"
+
+Tier 1.5 — PyTorch CPU tests (reason attribution). Run with torch installed:
+    pytest tests/ -m torch
 
 Tier 2 — GPU operation tests (cuDF/CuPy only, no Morpheus stages). Run on GPU host:
     pytest tests/ -m "gpu and not morpheus"
@@ -22,6 +25,14 @@ import sys
 import pytest
 import numpy as np
 import pandas as pd
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+requires_torch = pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch not available")
 from datetime import datetime
 
 # ── GPU availability ──────────────────────────────────────────────────────────
@@ -214,6 +225,464 @@ class TestScoringFormula:
     def test_score_clipped_to_10(self):
         # The production code clips to [0, 10]; confirm values above 10 exist before clip
         assert scale_score(200.0) > 10.0  # unclipped — proves clip is necessary
+
+
+# ── Reason attribution replica (CPU) ─────────────────────────────────────────
+
+REASON_MAP = {
+    0: "Volume Anomaly", 1: "Severity Spike", 2: "Unusual Event", 3: "Security Flag",
+    4: "Time Anomaly (Hour)", 5: "Time Anomaly (Hour)", 6: "Time Anomaly (Day)", 7: "Time Anomaly (Day)",
+    8: "User Anomaly", 9: "Message Length Anomaly", 10: "Process Anomaly",
+}
+for _ri in range(11, NUM_FEATURES):
+    REASON_MAP[_ri] = "Log Content Anomaly"
+
+
+def attribute_reason(abs_errors: torch.Tensor) -> np.ndarray:
+    """Replica of ManualInferenceStage relative-error reason attribution."""
+    feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
+    feat_iqr = (
+        torch.quantile(abs_errors, 0.75, dim=0)
+        - torch.quantile(abs_errors, 0.25, dim=0)
+    ).unsqueeze(0).clamp(min=0.01)
+    relative_errors = (abs_errors - feat_median) / feat_iqr
+    _, reason_indices = torch.max(relative_errors, dim=1)
+    return reason_indices.numpy()
+
+
+def _baseline_errors(batch_size: int = 200) -> torch.Tensor:
+    """Generate realistic baseline reconstruction errors: time features have
+    higher raw error (the exact problem the relative attribution fixes)."""
+    errors = torch.rand(batch_size, NUM_FEATURES) * 0.3
+    # Simulate the autoencoder's inherently higher error on cyclical features
+    errors[:, 4] += 0.8  # hour_sin
+    errors[:, 5] += 0.7  # hour_cos
+    errors[:, 6] += 0.5  # day_sin
+    errors[:, 7] += 0.5  # day_cos
+    return errors
+
+
+@pytest.mark.torch
+@requires_torch
+class TestReasonAttribution:
+    """Verify that relative-error reason attribution correctly identifies every
+    feature as the anomaly cause when that feature has an outlier error."""
+
+    @pytest.mark.parametrize("feature_idx", range(NUM_FEATURES))
+    def test_spiked_feature_is_selected(self, feature_idx):
+        """When one feature has a large outlier error in a single row, that row's
+        reason code should point to the spiked feature."""
+        errors = _baseline_errors(200)
+        target_row = 42
+        # Inject a spike much larger than anything else in that feature's column
+        errors[target_row, feature_idx] += 5.0
+        reasons = attribute_reason(errors)
+        assert reasons[target_row] == feature_idx, (
+            f"Expected feature {feature_idx} ({FEATURE_COLS[feature_idx]}) "
+            f"but got {reasons[target_row]} ({FEATURE_COLS[reasons[target_row]]})"
+        )
+
+    @pytest.mark.parametrize("feature_idx", range(NUM_FEATURES))
+    def test_reason_maps_to_known_string(self, feature_idx):
+        assert feature_idx in REASON_MAP, f"Feature {feature_idx} has no reason label"
+        assert isinstance(REASON_MAP[feature_idx], str)
+
+    def test_time_features_do_not_dominate_when_uniform(self):
+        """The old argmax approach always picked time features. With relative
+        attribution, a batch where all rows have similar errors should NOT
+        overwhelmingly pick any single feature category."""
+        errors = _baseline_errors(500)
+        reasons = attribute_reason(errors)
+        unique_reasons = set(reasons.tolist())
+        # Should see at least 4 distinct feature indices selected
+        assert len(unique_reasons) >= 4, (
+            f"Only {len(unique_reasons)} distinct reasons in a uniform batch: {unique_reasons}"
+        )
+
+    def test_old_argmax_would_always_pick_time(self):
+        """Confirm the baseline errors recreate the original bug — raw argmax
+        selects time features (index 4 or 5) for the vast majority of rows."""
+        errors = _baseline_errors(500)
+        raw_max_indices = torch.argmax(errors, dim=1).numpy()
+        time_count = np.isin(raw_max_indices, [4, 5, 6, 7]).sum()
+        assert time_count > 400, (
+            f"Baseline should cause time dominance, but only {time_count}/500 rows were time"
+        )
+
+    def test_each_reason_string_reachable(self):
+        """Every reason string in the map must be reachable by spiking the
+        corresponding feature."""
+        seen_reasons = set()
+        for feature_idx in range(NUM_FEATURES):
+            errors = _baseline_errors(100)
+            errors[0, feature_idx] += 5.0
+            reasons = attribute_reason(errors)
+            seen_reasons.add(REASON_MAP[int(reasons[0])])
+        expected = set(REASON_MAP.values())
+        assert seen_reasons == expected, f"Missing: {expected - seen_reasons}"
+
+    def test_multiple_spikes_picks_largest(self):
+        """When two features spike, the larger spike should win."""
+        errors = _baseline_errors(100)
+        row = 10
+        errors[row, 0] += 3.0   # Volume Anomaly
+        errors[row, 9] += 6.0   # Message Length — bigger spike
+        reasons = attribute_reason(errors)
+        assert reasons[row] == 9, (
+            f"Expected feature 9 (larger spike) but got {reasons[row]}"
+        )
+
+    def test_batch_size_one(self):
+        """Edge case: single-row batch. Median and IQR are degenerate but the
+        function should not crash."""
+        errors = torch.rand(1, NUM_FEATURES) * 0.5
+        errors[0, 8] = 3.0
+        reasons = attribute_reason(errors)
+        assert reasons[0] == 8
+
+    def test_all_features_identical_error_no_crash(self):
+        """When all features have the same error, any selection is valid —
+        just verify it doesn't crash or return out-of-range indices."""
+        errors = torch.ones(50, NUM_FEATURES) * 0.5
+        reasons = attribute_reason(errors)
+        assert all(0 <= r < NUM_FEATURES for r in reasons)
+
+    def test_reason_codes_shape_matches_batch(self):
+        batch_size = 317
+        errors = _baseline_errors(batch_size)
+        reasons = attribute_reason(errors)
+        assert reasons.shape == (batch_size,)
+
+    @pytest.mark.parametrize("feature_idx,expected_label", [
+        (0, "Volume Anomaly"),
+        (1, "Severity Spike"),
+        (2, "Unusual Event"),
+        (3, "Security Flag"),
+        (4, "Time Anomaly (Hour)"),
+        (5, "Time Anomaly (Hour)"),
+        (6, "Time Anomaly (Day)"),
+        (7, "Time Anomaly (Day)"),
+        (8, "User Anomaly"),
+        (9, "Message Length Anomaly"),
+        (10, "Process Anomaly"),
+        (11, "Log Content Anomaly"),
+        (18, "Log Content Anomaly"),
+    ])
+    def test_feature_index_to_label_mapping(self, feature_idx, expected_label):
+        assert REASON_MAP[feature_idx] == expected_label
+
+    def test_log_content_features_distinguishable(self):
+        """Features 11–18 all map to 'Log Content Anomaly' but the attribution
+        should still pick the specific index with the highest relative error."""
+        errors = _baseline_errors(100)
+        row = 0
+        # Spike feature_log_v5 (index 16) harder than the others
+        errors[row, 16] += 5.0
+        reasons = attribute_reason(errors)
+        assert reasons[row] == 16
+
+
+# ── Minimal CPU AutoEncoder (mirrors Morpheus AutoEncoder interface) ─────────
+
+def _build_cpu_autoencoder(input_dim: int = NUM_FEATURES):
+    """Build a tiny AutoEncoder matching the production architecture."""
+    encoder = torch.nn.Sequential(
+        torch.nn.Linear(input_dim, 12), torch.nn.ReLU(),
+        torch.nn.Linear(12, 8), torch.nn.ReLU(),
+    )
+    decoder = torch.nn.Sequential(
+        torch.nn.Linear(8, 12), torch.nn.ReLU(),
+        torch.nn.Linear(12, input_dim),
+    )
+    model = torch.nn.Sequential(encoder, decoder)
+    return model
+
+
+def _train_autoencoder(model, data: np.ndarray, epochs: int = 30):
+    """Train on normalized data; register saved_means/saved_scales buffers."""
+    means = np.mean(data, axis=0)
+    stds = np.maximum(np.std(data, axis=0), 0.1)
+    normalized = (data - means) / stds
+
+    model.register_buffer("saved_means", torch.tensor(means, dtype=torch.float32))
+    model.register_buffer("saved_scales", torch.tensor(stds, dtype=torch.float32))
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = torch.nn.MSELoss()
+    tensor_data = torch.tensor(normalized, dtype=torch.float32)
+
+    model.train()
+    for _ in range(epochs):
+        out = model(tensor_data)
+        loss = loss_fn(out, tensor_data)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    model.eval()
+
+
+def _run_inference(model, data: np.ndarray):
+    """Run the full ManualInferenceStage scoring + reason attribution on CPU.
+    Returns (scores, reason_labels) matching production logic."""
+    means = model.saved_means.numpy()
+    stds = model.saved_scales.numpy()
+    normalized = (data - means) / stds
+    input_t = torch.tensor(normalized, dtype=torch.float32)
+
+    with torch.no_grad():
+        reconstruction = model(input_t)
+        abs_errors = torch.abs(input_t - reconstruction)
+        max_err = torch.max(abs_errors, dim=1).values
+        mean_err = torch.mean(abs_errors, dim=1)
+        loss = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
+
+        # Relative reason attribution (matches production code)
+        feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
+        feat_iqr = (
+            torch.quantile(abs_errors, 0.75, dim=0)
+            - torch.quantile(abs_errors, 0.25, dim=0)
+        ).unsqueeze(0).clamp(min=0.01)
+        relative_errors = (abs_errors - feat_median) / feat_iqr
+        _, reason_indices = torch.max(relative_errors, dim=1)
+
+    scores_np = loss.numpy()
+    scaled = np.where(scores_np <= 1.5, scores_np * 2.0,
+                      3.0 + np.log1p(np.maximum(0, scores_np - 1.5)) * 2.0)
+    scaled = np.clip(scaled, 0.0, 10.0)
+
+    reason_codes = reason_indices.numpy()
+    labels = [REASON_MAP[int(r)] for r in reason_codes]
+    return scaled, labels, abs_errors.numpy()
+
+
+# ── Scenario-based feature profiles ─────────────────────────────────────────
+
+def _ssh_server_profile(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate n rows of 'normal SSH server' behavior.
+    Daytime activity, sshd process, medium priority, stable content."""
+    data = np.zeros((n, NUM_FEATURES), dtype=np.float32)
+    data[:, 0] = rng.normal(0.30, 0.05, n).clip(0, 1)     # log_count: moderate
+    data[:, 1] = rng.normal(0.86, 0.02, n).clip(0, 1)      # priority: info(6)/7
+    data[:, 2] = rng.normal(0.35, 0.03, n).clip(0, 1)      # event_type: stable
+    data[:, 3] = 0.0                                         # is_security_event: no
+    # Daytime hours (9-17) — cyclical encoding
+    hours = rng.uniform(9, 17, n)
+    data[:, 4] = np.sin(2 * np.pi * hours / 24).astype(np.float32)
+    data[:, 5] = np.cos(2 * np.pi * hours / 24).astype(np.float32)
+    # Weekdays only (Mon-Fri = 0-4)
+    days = rng.uniform(0, 4, n)
+    data[:, 6] = np.sin(2 * np.pi * days / 7).astype(np.float32)
+    data[:, 7] = np.cos(2 * np.pi * days / 7).astype(np.float32)
+    data[:, 8] = rng.normal(0.42, 0.02, n).clip(0, 1)      # user_hash: root/admin
+    data[:, 9] = rng.normal(0.25, 0.04, n).clip(0, 1)      # msg_len: short
+    data[:, 10] = rng.normal(0.55, 0.02, n).clip(0, 1)     # proc_hash: sshd
+    # Content hashes: stable, tightly clustered
+    for i in range(11, NUM_FEATURES):
+        data[:, i] = rng.normal(0.30 + 0.03 * (i - 11), 0.02, n).clip(0, 1)
+    return data
+
+
+def _new_webserver_profile(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate n rows of 'nginx just installed' behavior.
+    More logs, different priority, new process, 24/7 traffic, longer messages,
+    totally different content hashes. Some security events (TLS errors)."""
+    data = np.zeros((n, NUM_FEATURES), dtype=np.float32)
+    data[:, 0] = rng.normal(0.70, 0.08, n).clip(0, 1)      # log_count: doubled
+    data[:, 1] = rng.normal(0.14, 0.03, n).clip(0, 1)      # priority: notice(1)/7
+    data[:, 2] = rng.normal(0.72, 0.05, n).clip(0, 1)      # event_type: shifted
+    data[:, 3] = rng.choice([0.0, 1.0], n, p=[0.85, 0.15]) # is_security: 15% yes
+    # 24/7 traffic — uniform hours, includes weekends
+    hours = rng.uniform(0, 24, n)
+    data[:, 4] = np.sin(2 * np.pi * hours / 24).astype(np.float32)
+    data[:, 5] = np.cos(2 * np.pi * hours / 24).astype(np.float32)
+    days = rng.uniform(0, 7, n)
+    data[:, 6] = np.sin(2 * np.pi * days / 7).astype(np.float32)
+    data[:, 7] = np.cos(2 * np.pi * days / 7).astype(np.float32)
+    data[:, 8] = rng.normal(0.78, 0.03, n).clip(0, 1)      # user_hash: www-data
+    data[:, 9] = rng.normal(0.60, 0.06, n).clip(0, 1)      # msg_len: longer (access logs)
+    data[:, 10] = rng.normal(0.22, 0.02, n).clip(0, 1)     # proc_hash: nginx (new)
+    # Content hashes: completely different message templates
+    for i in range(11, NUM_FEATURES):
+        data[:, i] = rng.normal(0.70 + 0.02 * (i - 11), 0.03, n).clip(0, 1)
+    return data
+
+
+def _lateral_movement_profile(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate n rows of lateral movement: same processes but new users,
+    security events, unusual hours."""
+    data = _ssh_server_profile(n, rng)
+    data[:, 3] = rng.choice([0.0, 1.0], n, p=[0.4, 0.6])  # is_security: 60% yes
+    data[:, 8] = rng.normal(0.91, 0.03, n).clip(0, 1)      # user_hash: unknown users
+    # Late night activity (1-4 AM)
+    hours = rng.uniform(1, 4, n)
+    data[:, 4] = np.sin(2 * np.pi * hours / 24).astype(np.float32)
+    data[:, 5] = np.cos(2 * np.pi * hours / 24).astype(np.float32)
+    return data
+
+
+def _crypto_miner_profile(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate n rows of crypto-mining activity: massive log volume spike,
+    new process, but similar message patterns otherwise."""
+    data = _ssh_server_profile(n, rng)
+    data[:, 0] = rng.normal(0.92, 0.03, n).clip(0, 1)      # log_count: 3x normal
+    data[:, 10] = rng.normal(0.88, 0.02, n).clip(0, 1)     # proc_hash: xmrig/minerd
+    data[:, 9] = rng.normal(0.15, 0.03, n).clip(0, 1)      # msg_len: short status lines
+    return data
+
+
+@pytest.mark.torch
+@requires_torch
+class TestScenarioWebServerInstall:
+    """End-to-end scenario: train a model on SSH-server behavior, then infer
+    against 'someone just installed nginx' logs. Validates that the full
+    pipeline — normalization, autoencoder, scoring, reason attribution —
+    produces the expected multi-feature anomaly response."""
+
+    @pytest.fixture(autouse=True)
+    def setup_model(self):
+        self.rng = np.random.default_rng(seed=42)
+        self.model = _build_cpu_autoencoder()
+        baseline = _ssh_server_profile(2000, self.rng)
+        _train_autoencoder(self.model, baseline, epochs=50)
+        self.baseline_data = _ssh_server_profile(200, self.rng)
+        self.anomaly_data = _new_webserver_profile(200, self.rng)
+
+    def test_baseline_scores_low(self):
+        """Normal SSH traffic should score well below the anomaly threshold."""
+        scores, _, _ = _run_inference(self.model, self.baseline_data)
+        assert np.mean(scores) < 4.0, f"Baseline mean score {np.mean(scores):.2f} is too high"
+        assert np.median(scores) < 3.0
+
+    def test_webserver_scores_elevated(self):
+        """New web server traffic should produce clearly elevated scores."""
+        scores, _, _ = _run_inference(self.model, self.anomaly_data)
+        assert np.mean(scores) > 2.0, f"Anomaly mean score {np.mean(scores):.2f} is too low"
+
+    def test_webserver_scores_higher_than_baseline(self):
+        baseline_scores, _, _ = _run_inference(self.model, self.baseline_data)
+        anomaly_scores, _, _ = _run_inference(self.model, self.anomaly_data)
+        assert np.mean(anomaly_scores) > np.mean(baseline_scores) * 1.5
+
+    def test_multiple_reason_categories_triggered(self):
+        """A web server install should trigger several DIFFERENT anomaly
+        categories, not just one."""
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        unique_reasons = set(labels)
+        assert len(unique_reasons) >= 3, (
+            f"Expected at least 3 distinct anomaly reasons, got {unique_reasons}"
+        )
+
+    def test_process_anomaly_detected(self):
+        """nginx is a new process — Process Anomaly should appear."""
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        assert "Process Anomaly" in labels, (
+            f"Process Anomaly not found in: {set(labels)}"
+        )
+
+    def test_volume_or_content_anomaly_detected(self):
+        """Doubled log volume and new message templates should trigger at
+        least one of Volume Anomaly or Log Content Anomaly."""
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        assert "Volume Anomaly" in labels or "Log Content Anomaly" in labels, (
+            f"Neither Volume nor Content anomaly found in: {set(labels)}"
+        )
+
+    def test_no_single_reason_dominates(self):
+        """No single reason should account for more than 70% of the rows."""
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        from collections import Counter
+        counts = Counter(labels)
+        total = len(labels)
+        for reason, count in counts.items():
+            assert count / total < 0.70, (
+                f"'{reason}' dominates with {count}/{total} = {count/total:.0%}"
+            )
+
+    def test_per_feature_errors_show_expected_spikes(self):
+        """The raw per-feature errors should be elevated for the features we
+        know changed (process, volume, content) vs baseline."""
+        _, _, anomaly_errors = _run_inference(self.model, self.anomaly_data)
+        _, _, baseline_errors = _run_inference(self.model, self.baseline_data)
+        anomaly_mean = np.mean(anomaly_errors, axis=0)
+        baseline_mean = np.mean(baseline_errors, axis=0)
+        # Process hash (idx 10) should have notably higher error
+        assert anomaly_mean[10] > baseline_mean[10], "Process hash error should be elevated"
+        # At least half of the content hash features (11-18) should be elevated
+        content_elevated = sum(
+            1 for i in range(11, NUM_FEATURES) if anomaly_mean[i] > baseline_mean[i]
+        )
+        assert content_elevated >= 4, (
+            f"Only {content_elevated}/8 content features elevated"
+        )
+
+    def test_baseline_reasons_are_diverse(self):
+        """Even baseline traffic should show varied reasons (not all one type),
+        confirming the relative attribution works for 'normal' data too."""
+        _, labels, _ = _run_inference(self.model, self.baseline_data)
+        unique = set(labels)
+        assert len(unique) >= 2, f"Baseline reasons not diverse: {unique}"
+
+
+@pytest.mark.torch
+@requires_torch
+class TestScenarioLateralMovement:
+    """Scenario: attacker performing lateral movement — same host, but new
+    users, security events, and unusual hours."""
+
+    @pytest.fixture(autouse=True)
+    def setup_model(self):
+        self.rng = np.random.default_rng(seed=99)
+        self.model = _build_cpu_autoencoder()
+        baseline = _ssh_server_profile(2000, self.rng)
+        _train_autoencoder(self.model, baseline, epochs=50)
+        self.anomaly_data = _lateral_movement_profile(200, self.rng)
+
+    def test_scores_elevated(self):
+        scores, _, _ = _run_inference(self.model, self.anomaly_data)
+        assert np.mean(scores) > 2.0
+
+    def test_user_anomaly_detected(self):
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        assert "User Anomaly" in labels, f"User Anomaly not in {set(labels)}"
+
+    def test_security_flag_or_time_anomaly_detected(self):
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        has_security = "Security Flag" in labels
+        has_time = "Time Anomaly (Hour)" in labels
+        assert has_security or has_time, (
+            f"Expected Security Flag or Time Anomaly (Hour), got: {set(labels)}"
+        )
+
+    def test_multiple_reasons(self):
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        assert len(set(labels)) >= 2
+
+
+@pytest.mark.torch
+@requires_torch
+class TestScenarioCryptoMiner:
+    """Scenario: crypto miner installed — massive volume spike and new process,
+    but same user and similar message structure."""
+
+    @pytest.fixture(autouse=True)
+    def setup_model(self):
+        self.rng = np.random.default_rng(seed=77)
+        self.model = _build_cpu_autoencoder()
+        baseline = _ssh_server_profile(2000, self.rng)
+        _train_autoencoder(self.model, baseline, epochs=50)
+        self.anomaly_data = _crypto_miner_profile(200, self.rng)
+
+    def test_scores_elevated(self):
+        scores, _, _ = _run_inference(self.model, self.anomaly_data)
+        assert np.mean(scores) > 2.0
+
+    def test_volume_anomaly_detected(self):
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        assert "Volume Anomaly" in labels, f"Volume Anomaly not in {set(labels)}"
+
+    def test_process_anomaly_detected(self):
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        assert "Process Anomaly" in labels, f"Process Anomaly not in {set(labels)}"
 
 
 class TestEPSCalculation:

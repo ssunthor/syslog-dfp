@@ -786,12 +786,22 @@ class ManualInferenceStage(SinglePortStage):
             
             with torch.no_grad():
                 abs_errors = torch.abs(normalized_input - reconstruction)
-                max_err, max_indices = torch.max(abs_errors, dim=1)
+                max_err = torch.max(abs_errors, dim=1).values
                 mean_err = torch.mean(abs_errors, dim=1)
-                
+
                 # BLENDED LOSS (0.7 MAE + 0.3 MAX): Captures both general drift and extreme spikes
                 loss_f32 = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
-                reason_codes = max_indices.cpu().numpy()
+
+                # RELATIVE REASON ATTRIBUTION: Raw argmax always picks time features
+                # because sin/cos cyclical encoding has inherently high reconstruction
+                # error (autoencoder can't enforce sin²+cos²=1). Normalize each
+                # feature's error by its batch baseline so the reason reflects which
+                # feature is most *unusual*, not just highest raw error.
+                feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
+                feat_iqr = (torch.quantile(abs_errors, 0.75, dim=0) - torch.quantile(abs_errors, 0.25, dim=0)).unsqueeze(0).clamp(min=0.01)
+                relative_errors = (abs_errors - feat_median) / feat_iqr
+                _, reason_indices = torch.max(relative_errors, dim=1)
+                reason_codes = reason_indices.cpu().numpy()
             
             # DEFINE LEARNING STATE: Host is new or model is too immature (less than 5 training cycles)
             batch_v = self.gpu_versions[stats_ids].cpu().numpy()
