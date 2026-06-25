@@ -860,6 +860,192 @@ class ManualInferenceStage(SinglePortStage):
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
 
+@register_stage("threat-pattern")
+class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
+    """Maintains a per-host sliding window of recent anomaly causes and scores,
+    then matches known attack patterns to produce a 'threat_context' field.
+    Lightweight CPU work — no GPU tensors, just dict lookups on the batch."""
+
+    WINDOW_SECONDS = 300  # 5-minute lookback
+    MAX_WINDOW_SIZE = 200
+
+    # Each pattern: (name, description, matcher_fn)
+    # matcher_fn receives (reasons: Counter, scores: list, window_size: int)
+    # and returns True if the pattern matches.
+    PATTERNS = []
+
+    def __init__(self, c):
+        super().__init__(c)
+        # {source: deque of (timestamp, score, reason)}
+        self._windows = collections.defaultdict(collections.deque)
+
+    @property
+    def name(self): return "threat-pattern"
+    def accepted_types(self): return (MessageMeta,)
+    def supports_cpp_node(self): return False
+    def compute_schema(self, schema): return schema
+
+    @staticmethod
+    def _define_patterns():
+        """Pattern definitions. Each returns (label, description) or None."""
+        patterns = []
+
+        def brute_force(reasons, _scores, n):
+            sec_count = reasons.get("Security Flag", 0)
+            if sec_count >= 5 and sec_count / max(n, 1) > 0.3:
+                return ("Brute Force Attack",
+                        f"{sec_count} security events in window — repeated authentication failures indicate credential stuffing or brute force")
+            return None
+        patterns.append(brute_force)
+
+        def lateral_movement(reasons, _scores, _n):
+            has_user = reasons.get("User Anomaly", 0) >= 2
+            has_time = reasons.get("Time Anomaly (Hour)", 0) >= 1
+            has_sec = reasons.get("Security Flag", 0) >= 1
+            if has_user and (has_time or has_sec):
+                return ("Lateral Movement",
+                        "New user accounts active at unusual hours with security events — possible attacker pivoting through the network")
+            return None
+        patterns.append(lateral_movement)
+
+        def service_install(reasons, _scores, _n):
+            has_proc = reasons.get("Process Anomaly", 0) >= 2
+            has_content = reasons.get("Log Content Anomaly", 0) >= 3
+            has_volume = reasons.get("Volume Anomaly", 0) >= 1
+            if has_proc and (has_content or has_volume):
+                return ("New Service Detected",
+                        "New processes generating unfamiliar log patterns with volume changes — a new service or application has been installed")
+            return None
+        patterns.append(service_install)
+
+        def data_exfiltration(reasons, scores, _n):
+            has_volume = reasons.get("Volume Anomaly", 0) >= 3
+            high_scores = sum(1 for s in scores if s > 6.0)
+            if has_volume and high_scores >= 3:
+                return ("Possible Data Exfiltration",
+                        f"Sustained volume spikes with {high_scores} critical-severity scores — abnormal data transfer pattern")
+            return None
+        patterns.append(data_exfiltration)
+
+        def privilege_escalation(reasons, scores, _n):
+            has_user = reasons.get("User Anomaly", 0) >= 1
+            has_sec = reasons.get("Security Flag", 0) >= 2
+            high_scores = sum(1 for s in scores if s > 7.0)
+            if has_user and has_sec and high_scores >= 2:
+                return ("Privilege Escalation Attempt",
+                        "Unknown users triggering high-severity security events — possible privilege escalation or unauthorized access")
+            return None
+        patterns.append(privilege_escalation)
+
+        def crypto_mining(reasons, _scores, _n):
+            has_proc = reasons.get("Process Anomaly", 0) >= 2
+            has_volume = reasons.get("Volume Anomaly", 0) >= 2
+            if has_proc and has_volume and not reasons.get("Security Flag", 0):
+                return ("Suspicious Process Activity",
+                        "New high-volume processes without security flags — possible crypto miner, unauthorized daemon, or resource hijacking")
+            return None
+        patterns.append(crypto_mining)
+
+        def behavioral_drift(reasons, _scores, n):
+            distinct = sum(1 for v in reasons.values() if v >= 2)
+            if distinct >= 4 and n >= 10:
+                return ("Major Behavioral Shift",
+                        f"{distinct} distinct anomaly categories active — host behavior has fundamentally changed from its learned baseline")
+            return None
+        patterns.append(behavioral_drift)
+
+        def time_anomaly_sustained(reasons, _scores, n):
+            time_count = reasons.get("Time Anomaly (Hour)", 0) + reasons.get("Time Anomaly (Day)", 0)
+            if time_count >= 5 and time_count / max(n, 1) > 0.5:
+                return ("Off-Hours Activity",
+                        f"{time_count}/{n} events at unusual times — this host is active outside its normal operating schedule")
+            return None
+        patterns.append(time_anomaly_sustained)
+
+        return patterns
+
+    def _evaluate_host(self, source, now):
+        """Evaluate all patterns for a host and return the best match."""
+        window = self._windows.get(source)
+        if not window:
+            return None, None
+
+        # Prune old entries
+        cutoff = now - self.WINDOW_SECONDS
+        while window and window[0][0] < cutoff:
+            window.popleft()
+
+        if len(window) < 3:
+            return None, None
+
+        reasons = collections.Counter(entry[2] for entry in window)
+        scores = [entry[1] for entry in window]
+        n = len(window)
+
+        # Evaluate all patterns, pick the one with the highest implied severity
+        matches = []
+        for pattern_fn in self.PATTERNS:
+            result = pattern_fn(reasons, scores, n)
+            if result:
+                matches.append(result)
+
+        if not matches:
+            return None, None
+
+        # Return the first match (patterns are ordered by severity)
+        return matches[0]
+
+    def _process(self, msg: MessageMeta):
+        if msg is None:
+            return None
+        try:
+            with msg.mutable_dataframe() as df:
+                now = pytime.time()
+                sources = df["source"].to_pandas().values
+                scores = df["anomaly_score"].to_pandas().values
+                causes = df["anomaly_cause"].to_pandas().values
+
+                # Update windows for hosts with actual anomalies
+                for i in range(len(sources)):
+                    score = float(scores[i])
+                    cause = str(causes[i])
+                    if score > 2.0 and cause != "Learning...":
+                        src = str(sources[i])
+                        window = self._windows[src]
+                        window.append((now, score, cause))
+                        # Cap window size
+                        while len(window) > self.MAX_WINDOW_SIZE:
+                            window.popleft()
+
+                # Evaluate patterns for each unique source in this batch
+                context_labels = []
+                context_descriptions = []
+                unique_sources = {}
+                for src in set(sources):
+                    label, desc = self._evaluate_host(str(src), now)
+                    unique_sources[str(src)] = (label or "", desc or "")
+
+                for src in sources:
+                    pair = unique_sources.get(str(src), ("", ""))
+                    context_labels.append(pair[0])
+                    context_descriptions.append(pair[1])
+
+                df["threat_context"] = context_labels
+                df["threat_description"] = context_descriptions
+
+        except Exception as e:
+            logger.error(f"ThreatPattern Error: {e}")
+        return msg
+
+    def _build_single(self, builder, input_node):
+        node = builder.make_node(self.unique_name, ops.map(self._process))
+        builder.make_edge(input_node, node)
+        return node
+
+# Initialize patterns once at class definition time
+ThreatPatternStage.PATTERNS = ThreatPatternStage._define_patterns()
+
+
 @register_stage("python-kafka-sink")
 class PythonKafkaSink(SinglePortStage):
     def __init__(self, c, bootstrap_servers, output_topic):
@@ -1084,6 +1270,7 @@ def run_inference_pipeline():
             
             pipeline.add_stage(AsyncTrainingStage(config))
             pipeline.add_stage(ManualInferenceStage(config))
+            pipeline.add_stage(ThreatPatternStage(config))
             pipeline.add_stage(PythonKafkaSink(config, bootstrap_servers=KAFKA_BROKER, output_topic=OUTPUT_TOPIC))
             logger.info("🚀 Morpheus DFP Inference Pipeline starting..."); PIPELINE_HEALTH["status"] = "running"; pipeline.run()
         except Exception as e: logger.critical(f"🛑 FATAL PIPELINE ERROR: {e}"); PIPELINE_HEALTH["status"] = "error"; pytime.sleep(10)

@@ -685,6 +685,220 @@ class TestScenarioCryptoMiner:
         assert "Process Anomaly" in labels, f"Process Anomaly not in {set(labels)}"
 
 
+# ── Threat pattern matching (CPU-only, no torch) ────────────────────────────
+
+from collections import Counter
+
+# Replica of ThreatPatternStage._define_patterns() for CPU testing.
+# We import the actual pattern functions if morpheus_app is available,
+# otherwise replicate the logic so tests run anywhere.
+if MORPHEUS_AVAILABLE and hasattr(app, 'ThreatPatternStage'):
+    _PATTERNS = app.ThreatPatternStage.PATTERNS
+else:
+    # Standalone replicas — keep in sync with morpheus_app.py
+    def _p_brute_force(reasons, _scores, n):
+        sec = reasons.get("Security Flag", 0)
+        if sec >= 5 and sec / max(n, 1) > 0.3:
+            return ("Brute Force Attack", f"{sec} security events")
+        return None
+
+    def _p_lateral(reasons, _scores, _n):
+        if reasons.get("User Anomaly", 0) >= 2 and (reasons.get("Time Anomaly (Hour)", 0) >= 1 or reasons.get("Security Flag", 0) >= 1):
+            return ("Lateral Movement", "")
+        return None
+
+    def _p_service(reasons, _scores, _n):
+        if reasons.get("Process Anomaly", 0) >= 2 and (reasons.get("Log Content Anomaly", 0) >= 3 or reasons.get("Volume Anomaly", 0) >= 1):
+            return ("New Service Detected", "")
+        return None
+
+    def _p_exfil(reasons, scores, _n):
+        if reasons.get("Volume Anomaly", 0) >= 3 and sum(1 for s in scores if s > 6.0) >= 3:
+            return ("Possible Data Exfiltration", "")
+        return None
+
+    def _p_privesc(reasons, scores, _n):
+        if reasons.get("User Anomaly", 0) >= 1 and reasons.get("Security Flag", 0) >= 2 and sum(1 for s in scores if s > 7.0) >= 2:
+            return ("Privilege Escalation Attempt", "")
+        return None
+
+    def _p_crypto(reasons, _scores, _n):
+        if reasons.get("Process Anomaly", 0) >= 2 and reasons.get("Volume Anomaly", 0) >= 2 and not reasons.get("Security Flag", 0):
+            return ("Suspicious Process Activity", "")
+        return None
+
+    def _p_drift(reasons, _scores, n):
+        distinct = sum(1 for v in reasons.values() if v >= 2)
+        if distinct >= 4 and n >= 10:
+            return ("Major Behavioral Shift", "")
+        return None
+
+    def _p_offhours(reasons, _scores, n):
+        tc = reasons.get("Time Anomaly (Hour)", 0) + reasons.get("Time Anomaly (Day)", 0)
+        if tc >= 5 and tc / max(n, 1) > 0.5:
+            return ("Off-Hours Activity", "")
+        return None
+
+    _PATTERNS = [_p_brute_force, _p_lateral, _p_service, _p_exfil, _p_privesc, _p_crypto, _p_drift, _p_offhours]
+
+
+def _evaluate_patterns(reasons_dict, scores_list):
+    """Run all patterns against a reason/score set."""
+    reasons = Counter(reasons_dict)
+    n = sum(reasons.values())
+    matches = []
+    for fn in _PATTERNS:
+        result = fn(reasons, scores_list, n)
+        if result:
+            matches.append(result[0])
+    return matches
+
+
+class TestThreatPatterns:
+    """Verify each threat pattern fires on its expected input and does NOT
+    fire on unrelated inputs."""
+
+    def test_brute_force_triggers(self):
+        reasons = {"Security Flag": 8, "User Anomaly": 2}
+        matches = _evaluate_patterns(reasons, [5.0] * 10)
+        assert "Brute Force Attack" in matches
+
+    def test_brute_force_needs_threshold(self):
+        reasons = {"Security Flag": 3}
+        matches = _evaluate_patterns(reasons, [5.0] * 3)
+        assert "Brute Force Attack" not in matches
+
+    def test_lateral_movement_triggers(self):
+        reasons = {"User Anomaly": 3, "Time Anomaly (Hour)": 2, "Security Flag": 1}
+        matches = _evaluate_patterns(reasons, [4.0] * 6)
+        assert "Lateral Movement" in matches
+
+    def test_lateral_movement_needs_user_plus_time_or_security(self):
+        reasons = {"User Anomaly": 3}
+        matches = _evaluate_patterns(reasons, [4.0] * 3)
+        assert "Lateral Movement" not in matches
+
+    def test_service_install_triggers(self):
+        reasons = {"Process Anomaly": 3, "Log Content Anomaly": 5, "Volume Anomaly": 2}
+        matches = _evaluate_patterns(reasons, [4.0] * 10)
+        assert "New Service Detected" in matches
+
+    def test_service_install_proc_plus_volume(self):
+        reasons = {"Process Anomaly": 3, "Volume Anomaly": 2}
+        matches = _evaluate_patterns(reasons, [4.0] * 5)
+        assert "New Service Detected" in matches
+
+    def test_service_install_needs_process(self):
+        reasons = {"Log Content Anomaly": 10, "Volume Anomaly": 5}
+        matches = _evaluate_patterns(reasons, [4.0] * 15)
+        assert "New Service Detected" not in matches
+
+    def test_data_exfiltration_triggers(self):
+        reasons = {"Volume Anomaly": 5}
+        matches = _evaluate_patterns(reasons, [7.0] * 5)
+        assert "Possible Data Exfiltration" in matches
+
+    def test_data_exfiltration_needs_high_scores(self):
+        reasons = {"Volume Anomaly": 5}
+        matches = _evaluate_patterns(reasons, [3.0] * 5)
+        assert "Possible Data Exfiltration" not in matches
+
+    def test_privilege_escalation_triggers(self):
+        reasons = {"User Anomaly": 2, "Security Flag": 3}
+        matches = _evaluate_patterns(reasons, [8.0] * 5)
+        assert "Privilege Escalation Attempt" in matches
+
+    def test_crypto_mining_triggers(self):
+        reasons = {"Process Anomaly": 3, "Volume Anomaly": 4}
+        matches = _evaluate_patterns(reasons, [5.0] * 7)
+        assert "Suspicious Process Activity" in matches
+
+    def test_crypto_mining_suppressed_by_security_flag(self):
+        reasons = {"Process Anomaly": 3, "Volume Anomaly": 4, "Security Flag": 1}
+        matches = _evaluate_patterns(reasons, [5.0] * 8)
+        assert "Suspicious Process Activity" not in matches
+
+    def test_behavioral_drift_triggers(self):
+        reasons = {
+            "Volume Anomaly": 3, "Process Anomaly": 2,
+            "User Anomaly": 2, "Log Content Anomaly": 4,
+        }
+        matches = _evaluate_patterns(reasons, [4.0] * 11)
+        assert "Major Behavioral Shift" in matches
+
+    def test_behavioral_drift_needs_enough_events(self):
+        reasons = {
+            "Volume Anomaly": 2, "Process Anomaly": 2,
+            "User Anomaly": 2, "Log Content Anomaly": 2,
+        }
+        matches = _evaluate_patterns(reasons, [4.0] * 8)
+        assert "Major Behavioral Shift" not in matches
+
+    def test_off_hours_triggers(self):
+        reasons = {"Time Anomaly (Hour)": 8, "Volume Anomaly": 1}
+        matches = _evaluate_patterns(reasons, [4.0] * 9)
+        assert "Off-Hours Activity" in matches
+
+    def test_off_hours_needs_majority(self):
+        reasons = {"Time Anomaly (Hour)": 3, "Volume Anomaly": 10}
+        matches = _evaluate_patterns(reasons, [4.0] * 13)
+        assert "Off-Hours Activity" not in matches
+
+    def test_normal_traffic_no_patterns(self):
+        reasons = {"Volume Anomaly": 1, "Log Content Anomaly": 1}
+        matches = _evaluate_patterns(reasons, [3.0] * 2)
+        assert matches == []
+
+    def test_multiple_patterns_can_fire(self):
+        reasons = {
+            "Security Flag": 6, "User Anomaly": 3,
+            "Time Anomaly (Hour)": 2,
+        }
+        matches = _evaluate_patterns(reasons, [8.0] * 11)
+        assert "Brute Force Attack" in matches
+        assert "Lateral Movement" in matches
+
+    def test_webserver_install_scenario(self):
+        """Simulates the reason distribution from a new web server install."""
+        reasons = {
+            "Process Anomaly": 5, "Log Content Anomaly": 8,
+            "Volume Anomaly": 4, "Severity Spike": 2,
+            "Message Length Anomaly": 3,
+        }
+        matches = _evaluate_patterns(reasons, [5.0] * 22)
+        assert "New Service Detected" in matches
+        assert "Brute Force Attack" not in matches
+
+    def test_crypto_miner_scenario(self):
+        """Simulates the reason distribution from a crypto miner."""
+        reasons = {"Process Anomaly": 6, "Volume Anomaly": 8, "Message Length Anomaly": 2}
+        matches = _evaluate_patterns(reasons, [6.0] * 16)
+        assert "Suspicious Process Activity" in matches
+
+    def test_all_patterns_reachable(self):
+        """Every defined pattern label must be triggerable."""
+        expected = {
+            "Brute Force Attack", "Lateral Movement", "New Service Detected",
+            "Possible Data Exfiltration", "Privilege Escalation Attempt",
+            "Suspicious Process Activity", "Major Behavioral Shift", "Off-Hours Activity",
+        }
+        scenarios = [
+            ({"Security Flag": 8}, [5.0] * 8),
+            ({"User Anomaly": 3, "Time Anomaly (Hour)": 2}, [4.0] * 5),
+            ({"Process Anomaly": 3, "Log Content Anomaly": 5}, [4.0] * 8),
+            ({"Volume Anomaly": 5}, [7.0] * 5),
+            ({"User Anomaly": 2, "Security Flag": 3}, [8.0] * 5),
+            ({"Process Anomaly": 4, "Volume Anomaly": 4}, [5.0] * 8),
+            ({"Volume Anomaly": 3, "Process Anomaly": 2, "User Anomaly": 2, "Log Content Anomaly": 4}, [4.0] * 11),
+            ({"Time Anomaly (Hour)": 8}, [4.0] * 8),
+        ]
+        seen = set()
+        for reasons, scores in scenarios:
+            for label in _evaluate_patterns(reasons, scores):
+                seen.add(label)
+        assert seen == expected, f"Missing: {expected - seen}"
+
+
 class TestEPSCalculation:
     def test_30_second_window(self):
         ts = pd.to_datetime(["2026-06-09 10:00:00", "2026-06-09 10:00:30"])
