@@ -4,13 +4,14 @@
 import os
 import logging
 import joblib
+import pickle
 import pandas as pd
 import numpy as np
 import warnings
 import uuid
 import shutil
 import time as pytime
-from concurrent.futures import ThreadPoolExecutor 
+from concurrent.futures import ThreadPoolExecutor
 import collections
 import threading
 import gc
@@ -332,6 +333,19 @@ def warm_up_model_cache():
                     GLOBAL_MODEL_CACHE[user_id] = loaded
                     GLOBAL_TRAIN_COUNTER[user_id] = latest_v_num
                     count += 1
+
+                    # Restore rolling window snapshot so the host immediately
+                    # re-qualifies for training without re-accumulating from zero.
+                    snapshot_path = os.path.join(host_path, "window_snapshot.pkl")
+                    if os.path.exists(snapshot_path):
+                        try:
+                            with open(snapshot_path, "rb") as sf:
+                                snap_df = pickle.load(sf)
+                            if isinstance(snap_df, pd.DataFrame) and len(snap_df) > 0:
+                                with ROLLING_WINDOW_LOCK:
+                                    ROLLING_WINDOW_CACHE[user_id] = snap_df
+                        except Exception as snap_err:
+                            logger.warning(f"Could not restore window snapshot for {user_id}: {snap_err}")
             except Exception as e:
                 logger.warning(f"Error loading model for {user_id}: {e}")
     except Exception as e:
@@ -649,7 +663,20 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
                             os.remove(os.path.join(host_dir, f))
                 except Exception as e:
                     logger.warning(f"Version pruning error for {user_id}: {e}")
-                
+
+                # ROLLING WINDOW SNAPSHOT: Persist the last 1 000 rows so the
+                # host immediately re-qualifies for training after a restart.
+                try:
+                    with ROLLING_WINDOW_LOCK:
+                        snap = ROLLING_WINDOW_CACHE.get(user_id)
+                    if snap is not None and len(snap) > 0:
+                        snap_tail = snap.tail(1000).reset_index(drop=True)
+                        snap_path = os.path.join(host_dir, "window_snapshot.pkl")
+                        with open(snap_path, "wb") as sf:
+                            pickle.dump(snap_tail, sf, protocol=pickle.HIGHEST_PROTOCOL)
+                except Exception as snap_err:
+                    logger.warning(f"Could not save window snapshot for {user_id}: {snap_err}")
+
                 MODEL_UPDATED_EVENT.set(); logger.info(f"💾 SAVED: Host {user_id} Version {count} (Lightweight)")
         except Exception as e: logger.error(f"❌ Training Thread Error for {user_id}: {e}")
         finally:
@@ -720,7 +747,7 @@ class ManualInferenceStage(SinglePortStage):
 
     def __init__(self, c):
         super().__init__(c); self._debug_counter = 0; self._gc_anchor = collections.deque(maxlen=5)
-        self._last_reload = pytime.time(); self._min_reload_cooldown = 120.0
+        self._last_reload = pytime.time(); self._min_reload_cooldown = 30.0
         self._feature_weights = torch.tensor(self.FEATURE_WEIGHTS, device="cuda", dtype=torch.float32)
         self._build_gpu_lookups()
     def _build_gpu_lookups(self):
@@ -818,9 +845,10 @@ class ManualInferenceStage(SinglePortStage):
                 _, reason_indices = torch.max(relative_errors, dim=1)
                 reason_codes = reason_indices.cpu().numpy()
             
-            # DEFINE LEARNING STATE: Host is new or model is too immature (less than 5 training cycles)
+            # DEFINE LEARNING STATE: Host is new (no model) or untrained (version 0).
+            # Version >= 1 means a model exists and has been fit at least once — score it.
             batch_v = self.gpu_versions[stats_ids].cpu().numpy()
-            is_learning = (stats_ids == 0).cpu().numpy() | (batch_v < 5)
+            is_learning = (stats_ids == 0).cpu().numpy() | (batch_v < 1)
             
             scores_cp = cp.asarray(loss_f32)
             is_learning_cp = cp.asarray(is_learning)
