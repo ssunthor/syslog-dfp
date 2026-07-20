@@ -18,6 +18,7 @@ import json
 import psutil
 from datetime import datetime, timedelta
 import rmm
+import rmm.mr as rmm_mr
 from confluent_kafka import Producer, Consumer, KafkaError
 
 # --- CUDA / ML ---
@@ -26,15 +27,52 @@ import cupy as cp
 import torch
 import mlflow
 
-# Initialize RMM with a fixed pool to prevent it from growing indefinitely
+# Initialize RMM with a fixed pool + failure callback so OOM attempts cache
+# flushes and retries before raising, rather than crashing the pipeline.
+_rmm_oom_count = 0
+_rmm_oom_window_start = 0.0
+
+kafka_batch_size = os.getenv("KAFKA_BATCH_SIZE", 1024)
+kafka_edge_buffer = os.getenv("KAFKA_EDGE_BUFFER", 128)
+
+def _rmm_oom_handler(nbytes, nothrow=False):
+    global _rmm_oom_count, _rmm_oom_window_start
+    now = pytime.time()
+    if now - _rmm_oom_window_start > 10.0:
+        _rmm_oom_count = 0
+        _rmm_oom_window_start = now
+    _rmm_oom_count += 1
+
+    _log = logging.getLogger(__name__)
+    if _rmm_oom_count == 1:
+        _log.warning(f"RMM pool exhausted (requested {nbytes:,} B) — flushing caches and retrying")
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return True
+    if _rmm_oom_count <= 3:
+        return True  # retry without re-flushing — nothing new to free
+    _log.error(f"RMM pool exhausted (requested {nbytes:,} B) — {_rmm_oom_count} failures in 10s, raising")
+    return False  # propagate the exception so the stage can recover
+
 try:
-    rmm.reinitialize(
-        pool_allocator=True,
-        initial_pool_size=1 * 1024 * 1024 * 1024, # 1GB
-        maximum_pool_size=3 * 1024 * 1024 * 1024  # 3GB
+    _rmm_max_gb = float(os.environ.get("RMM_POOL_MAX_GB", "3"))
+    _rmm_init_gb = min(1.0, _rmm_max_gb)
+    _pool_mr = rmm_mr.PoolMemoryResource(
+        rmm_mr.CudaMemoryResource(),
+        initial_pool_size=int(_rmm_init_gb * 1024 ** 3),
+        maximum_pool_size=int(_rmm_max_gb * 1024 ** 3),
+    )
+    rmm_mr.set_current_device_resource(
+        rmm_mr.FailureCallbackResourceAdaptor(_pool_mr, _rmm_oom_handler)
     )
     if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.3, 0) # Max 30% of GPU 0
+        _pt_fraction = float(os.environ.get("PYTORCH_MEMORY_FRACTION", "0.3"))
+        torch.cuda.set_per_process_memory_fraction(_pt_fraction, 0)
 except Exception as e:
     print(f"⚠️ Memory Initialization Warning: {e}")
 
@@ -123,14 +161,24 @@ GLOBAL_MODEL_CACHE = {}
 GLOBAL_TRAIN_COUNTER = {}
 MODEL_CACHE_LOCK = threading.Lock()
 
+# Per-host rolling window of recent feature vectors used for DFP training.
+# Without this, each training run only sees the current 2-second batch (100-16k rows),
+# which is far too little data to learn stable behavioral baselines.
+# DFP_ROLLING_WINDOW_ROWS controls the cap per host (default: 50k rows).
+# At 100 EPS per host that is ~8 minutes of history; tune upward for busier hosts.
+ROLLING_WINDOW_CACHE = {}   # {user_id: pd.DataFrame}
+ROLLING_WINDOW_LOCK = threading.Lock()
+ROLLING_WINDOW_MAX_ROWS = int(os.getenv("DFP_ROLLING_WINDOW_ROWS", "50000"))
+
 CONTROL_TOPIC = os.getenv("KAFKA_CONTROL_TOPIC", "morpheus-control")
 
 def process_feedback_locally(source, features):
     """Internal logic to save feedback and fine-tune model if loaded."""
     if not source or not features: return None
     
-    # Filter only relevant feature columns
-    filtered_features = {k: v for k, v in features.items() if k in FEATURE_COLS}
+    # Ensure all 19 feature columns are present; missing keys default to 0.0 to prevent
+    # NaN values when this dict is later concatenated with the full training DataFrame.
+    filtered_features = {k: float(features.get(k, 0.0)) for k in FEATURE_COLS}
     
     feedback_path = os.path.join(FEEDBACK_DIR, f"{source}.json")
     try:
@@ -212,7 +260,10 @@ def control_worker():
     conf = {
         'bootstrap.servers': broker,
         'group.id': pod_id,
-        'auto.offset.reset': 'latest'
+        'auto.offset.reset': 'latest',
+        # Control worker can be starved of CPU during heavy GPU batch processing;
+        # raise the interval so it doesn't get kicked from the group under load.
+        'max.poll.interval.ms': '1800000',  # 30 minutes
     }
     
     consumer = Consumer(conf)
@@ -291,7 +342,16 @@ def warm_up_model_cache():
 def memory_manager_worker():
     while True:
         try:
-            if psutil.virtual_memory().percent > 60:
+            cpu_pct = psutil.virtual_memory().percent
+            gpu_pct = 0.0
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info(0)
+                gpu_pct = (1.0 - free / total) * 100.0
+            if cpu_pct > 60 or gpu_pct > 85:
+                if gpu_pct > 85:
+                    logging.getLogger(__name__).warning(
+                        f"GPU memory pressure: {gpu_pct:.1f}% used — freeing caches"
+                    )
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
                 cp.get_default_memory_pool().free_all_blocks()
@@ -315,13 +375,16 @@ def model_janitor_worker():
                         logger.info(f"🧹 JANITOR: Pruning stale host model: {host_dir_name} (Last seen > 48h ago)")
                         shutil.rmtree(host_path)
                         
-                        # Also remove from memory cache if present
+                        # Also remove from in-memory caches
                         user_id = host_dir_name.replace("dfp-", "")
                         with MODEL_CACHE_LOCK:
                             if user_id in GLOBAL_MODEL_CACHE:
                                 del GLOBAL_MODEL_CACHE[user_id]
                                 if user_id in GLOBAL_TRAIN_COUNTER:
                                     del GLOBAL_TRAIN_COUNTER[user_id]
+                        with ROLLING_WINDOW_LOCK:
+                            if user_id in ROLLING_WINDOW_CACHE:
+                                del ROLLING_WINDOW_CACHE[user_id]
             
             # Run every 6 hours
             pytime.sleep(6 * 3600)
@@ -352,7 +415,7 @@ class AccumulatorStage(SinglePortStage):
         now = pytime.time()
         if self._count < self.batch_size and (now - self._last_flush < self.max_latency) and self._count < self.max_buffer_size: return None 
         try:
-            big_gdf = cudf.concat(self._buffer); self._buffer = []; self._count = 0; self._last_flush = now
+            big_gdf = cudf.concat(self._buffer, ignore_index=True); self._buffer = []; self._count = 0; self._last_flush = now
             dt = now - self._perf_last_time
             if dt >= 5.0:
                 # Log the total windowed throughput to accurately reflect pod performance
@@ -365,12 +428,14 @@ class AccumulatorStage(SinglePortStage):
 
 @register_stage("gpu-preprocessing")
 class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
-    def __init__(self, c): 
+    def __init__(self, c):
         super().__init__(c)
         self._ip_regex = r"from\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
         self._host_regex = r"(?:<\d+>)?([A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+([a-zA-Z0-9\.\-_]+)"
         self._user_regex = r"(?:user|for user|User|User=)\s*([a-zA-Z0-9\.\-_]+)"
         self._process_regex = r"(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+[a-zA-Z0-9\.\-_]+\s+([a-zA-Z0-9\.\-_]+)(?:\[\d+\])?: "
+        # RFC 5424: <PRI>VERSION ISO-TIMESTAMP hostname ...
+        self._rfc5424_ts_regex = r"(?:<\d+>)\d+\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
     @property
     def name(self): return "gpu-preprocessing"
     def accepted_types(self): return (ControlMessage,)
@@ -380,6 +445,7 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
         with msg.payload().mutable_dataframe() as df:
             try:
                 for col in FEATURE_COLS: df[col] = 0.0
+                now = datetime.utcnow()
                 if "message" in df.columns:
                     msg_col = df["message"]
                     extracted_host = msg_col.str.extract(self._host_regex, expand=True)[1]
@@ -388,23 +454,48 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                     df["feature_msg_len"] = (msg_col.str.len() / 512.0).astype("float32").clip(0.0, 1.0)
                     users = msg_col.str.extract(self._user_regex, expand=True)[0].fillna("none")
                     procs = msg_col.str.extract(self._process_regex, expand=True)[0].fillna("unknown")
-                    df["feature_user_hash"] = (users.hash_values() % 1000).astype("float32") / 1000.0
-                    df["feature_proc_hash"] = (procs.hash_values() % 1000).astype("float32") / 1000.0
-                    for i in range(NUM_LOG_FEATURES): df[f"feature_log_v{i}"] = (msg_col.hash_values(seed=i) % 1000).astype("float32") / 1000.0
-                else: df["source"] = "unknown_source"
+                    # Extract to CuPy arrays before arithmetic to bypass cuDF index alignment.
+                    # cp.abs() normalises negative int32 hash values before the modulo.
+                    df["feature_user_hash"] = (cp.abs(users.hash_values().values) % cp.int32(100000)).astype(cp.float32) / cp.float32(100000.0)
+                    df["feature_proc_hash"] = (cp.abs(procs.hash_values().values) % cp.int32(100000)).astype(cp.float32) / cp.float32(100000.0)
+                    for i in range(NUM_LOG_FEATURES):
+                        df[f"feature_log_v{i}"] = (cp.abs(msg_col.hash_values(seed=i).values) % cp.int32(100000)).astype(cp.float32) / cp.float32(100000.0)
 
-                now = datetime.utcnow()
-                rows = len(df); time_offsets = cp.arange(rows, dtype='int64') * 1000 
-                df["timestamp"] = cudf.to_datetime(time_offsets + int(now.timestamp() * 1e9), unit="ns")
+                    # Parse actual syslog timestamps so temporal features reflect real event time.
+                    # Use pandas on the CPU: pd.to_datetime fully supports errors='coerce' for
+                    # Series, avoiding multiple cudf.to_datetime quirks in v25.x (no Series-level
+                    # errors='coerce', index-alignment issues with string + operator).
+                    # The CPU round-trip is one string column (~1-2 MB at 16k rows) — negligible.
+                    msg_pd = msg_col.to_pandas()
+                    year_str = str(now.year) + ' '
 
-                # Per-row time features (Vectorized on GPU)
-                hours = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
-                days = df["timestamp"].dt.weekday.astype("float32")
-                
-                df["feature_hour_sin"] = cp.sin(2 * np.pi * hours / 24.0).astype("float32")
-                df["feature_hour_cos"] = cp.cos(2 * np.pi * hours / 24.0).astype("float32")
-                df["feature_day_sin"] = cp.sin(2 * np.pi * days / 7.0).astype("float32")
-                df["feature_day_cos"] = cp.cos(2 * np.pi * days / 7.0).astype("float32")
+                    # RFC 3164: "Jan  1 12:00:00" (group 0 of _host_regex)
+                    ts_raw_pd = msg_pd.str.extract(self._host_regex, expand=True)[0]
+                    ts_norm_pd = ts_raw_pd.str.replace(r'\s+', ' ', regex=True).str.strip()
+                    parsed_3164_pd = pd.to_datetime(
+                        year_str + ts_norm_pd, format="%Y %b %d %H:%M:%S", errors='coerce'
+                    )
+
+                    # RFC 5424: "2026-01-01T12:00:00..." (group 0 of _rfc5424_ts_regex)
+                    ts_5424_pd = msg_pd.str.extract(self._rfc5424_ts_regex, expand=True)[0]
+                    parsed_5424_pd = pd.to_datetime(
+                        ts_5424_pd, format="%Y-%m-%dT%H:%M:%S", errors='coerce'
+                    )
+
+                    combined_ts = parsed_3164_pd.fillna(parsed_5424_pd).fillna(pd.Timestamp(now))
+                    # Assign via numpy array (no pandas index) so cuDF assigns by position
+                    df["timestamp"] = cudf.Series(combined_ts.values.astype("datetime64[ns]"))
+                else:
+                    df["source"] = "unknown_source"
+                    df["timestamp"] = pd.Timestamp(now)
+
+                # Per-row time features — extract to CuPy to bypass cuDF index alignment.
+                hours_cp = (df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0).values
+                days_cp = df["timestamp"].dt.weekday.astype("float32").values
+                df["feature_hour_sin"] = cp.sin(2 * cp.float32(cp.pi) * hours_cp / cp.float32(24.0)).astype(cp.float32)
+                df["feature_hour_cos"] = cp.cos(2 * cp.float32(cp.pi) * hours_cp / cp.float32(24.0)).astype(cp.float32)
+                df["feature_day_sin"] = cp.sin(2 * cp.float32(cp.pi) * days_cp / cp.float32(7.0)).astype(cp.float32)
+                df["feature_day_cos"] = cp.cos(2 * cp.float32(cp.pi) * days_cp / cp.float32(7.0)).astype(cp.float32)
             except Exception as e: logger.error(f"Preprocessing Early Error: {e}")
         return msg
     def _build_single(self, builder, input_node):
@@ -412,7 +503,24 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
 
 @register_stage("gpu-feature-mapping")
 class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
-    def __init__(self, c): super().__init__(c)
+    def __init__(self, c):
+        super().__init__(c)
+        # Load class counts from the Triton label encoders so we normalize priority and
+        # event_type by the actual number of classes rather than hardcoded guesses.
+        self._priority_classes = 8    # RFC 3164 has 8 severity levels (0-7); safe default
+        self._event_type_classes = 10  # fallback; overridden below if encoder loads
+        model_dir = os.environ.get("INFERENCE_MODELS_DIR", "/app/models/inference")
+        try:
+            for attr, filename in [("_priority_classes", "priority_label_encoder.joblib"),
+                                    ("_event_type_classes", "event_type_label_encoder.joblib")]:
+                path = os.path.join(model_dir, filename)
+                if os.path.exists(path):
+                    enc = joblib.load(path)
+                    if hasattr(enc, "classes_") and len(enc.classes_) > 1:
+                        setattr(self, attr, len(enc.classes_))
+                        logger.info(f"Loaded {filename}: {len(enc.classes_)} classes")
+        except Exception as e:
+            logger.warning(f"Could not load label encoders for feature normalization, using defaults: {e}")
     @property
     def name(self): return "gpu-feature-mapping"
     def accepted_types(self): return (ControlMessage,)
@@ -421,19 +529,27 @@ class GPUFeatureMappingStage(PassThruTypeMixin, SinglePortStage):
         if msg is None: return None
         with msg.payload().mutable_dataframe() as df:
             try:
-                rows = len(df); duration_sec = max(float(rows) * 1000.0 / 1e9, 0.001)
+                # Use the actual timestamp range of the batch to compute a real EPS.
+                # Previously this used (rows * 1µs) as the window, producing values ~100x too high.
+                if "timestamp" in df.columns:
+                    # cuDF max/min on datetime returns numpy.timedelta64 (not pandas.Timedelta),
+                    # so use pd.Timedelta() conversion to get total_seconds() reliably.
+                    ts_diff = pd.Timedelta(df["timestamp"].max() - df["timestamp"].min())
+                    duration_sec = max(ts_diff.total_seconds(), 1.0)  # floor at 1s for same-second batches
+                else:
+                    duration_sec = 2.0  # AccumulatorStage max_latency fallback
                 counts = df['source'].value_counts()
-                
+
                 # OPTIMIZATION: Log-scaled volume (Prevents volume spikes from exploding the score)
                 eps = (df['source'].map(counts) / duration_sec * 60.0).astype('float32')
                 df['feature_log_count'] = cp.log1p(eps) / 10.0 # Normalized roughly for 0-20k EPS
                 
-                # Squashing discrete features to 0-1 range
+                # Normalize Triton class labels to [0, 1] using the actual number of classes.
+                # Dividing by (num_classes - 1) maps label 0 -> 0.0 and label N-1 -> 1.0.
                 if "priority" in df.columns:
-                    df["feature_priority"] = df["priority"].astype("float32") / 7.0
+                    df["feature_priority"] = df["priority"].astype("float32") / float(self._priority_classes - 1)
                 if "event_type" in df.columns:
-                    # Assuming max 100 event types, squash to 0-1
-                    df["feature_event_type"] = (df["event_type"].astype("float32") % 100) / 100.0
+                    df["feature_event_type"] = df["event_type"].astype("float32") / float(self._event_type_classes - 1)
                 if "is_security_event" in df.columns:
                     df["feature_is_security_event"] = df["is_security_event"].astype("float32")
                 
@@ -452,9 +568,9 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
     def name(self): return "async-training"
     def accepted_types(self): return (ControlMessage,)
     def supports_cpp_node(self): return False
-    def _train_and_save(self, pdf, user_id, count):
+    def _train_and_save(self, window_snapshot, user_id, count):
         try:
-            train_data = pdf[FEATURE_COLS]
+            train_data = window_snapshot  # already FEATURE_COLS only (from ROLLING_WINDOW_CACHE)
             
             # INCLUDE FEEDBACK: Merge saved user overrides into the training set
             feedback_path = os.path.join(FEEDBACK_DIR, f"{user_id}.json")
@@ -464,8 +580,13 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
                         feedback_list = json.load(f)
                     if feedback_list and isinstance(feedback_list, list):
                         feedback_df = pd.DataFrame(feedback_list)
+                        # Fill any columns missing from the feedback payload with 0.0 so the
+                        # concat below never introduces NaN values into the training matrix.
+                        for col in FEATURE_COLS:
+                            if col not in feedback_df.columns:
+                                feedback_df[col] = 0.0
+                        feedback_df = feedback_df[FEATURE_COLS]
                         # Upsample feedback so it carries weight in the full training batch
-                        # (repeating feedback 10x vs the thousand+ samples in pdf)
                         feedback_upsampled = pd.concat([feedback_df] * 10, ignore_index=True)
                         train_data = pd.concat([train_data, feedback_upsampled], ignore_index=True)
                         logger.info(f"🧬 AUGMENTED: Added {len(feedback_list)} feedback samples (upsampled to {len(feedback_upsampled)}) to training for {user_id}")
@@ -496,20 +617,21 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
             # Using pandas broadcasting for consistency with FEATURE_COLS
             normalized_train_data = (train_data - means) / robust_stds
             
-            with TRAINING_LOCK: 
+            with TRAINING_LOCK:
                 # Train for 3 epochs for better convergence
-                model.fit(normalized_train_data, epochs=3) 
-            
-            # SYNC: Update global counter so inference engine knows we have progressed
-            with MODEL_CACHE_LOCK:
-                GLOBAL_TRAIN_COUNTER[user_id] = max(GLOBAL_TRAIN_COUNTER.get(user_id, 0), count)
-            
-            # SIGNAL: Notify inference engine that metadata (version/means) has changed
-            MODEL_UPDATED_EVENT.set()
+                model.fit(normalized_train_data, epochs=3)
 
-            # Update Buffers
+            # Register normalization buffers on the model BEFORE signaling the inference engine.
+            # Previously MODEL_UPDATED_EVENT was set first, creating a race where _build_gpu_lookups
+            # could read model.saved_means before register_buffer had run, loading stale stats.
             model.register_buffer("saved_means", torch.tensor(means, dtype=torch.float32, device=device))
             model.register_buffer("saved_scales", torch.tensor(robust_stds, dtype=torch.float32, device=device))
+
+            # SYNC: Update global counter, then signal inference engine
+            with MODEL_CACHE_LOCK:
+                GLOBAL_TRAIN_COUNTER[user_id] = max(GLOBAL_TRAIN_COUNTER.get(user_id, 0), count)
+
+            MODEL_UPDATED_EVENT.set()
             
             if count == 1 or (count > 0 and count % self._save_interval == 0):
                 host_dir = os.path.join(MODEL_DIR, f"dfp-{user_id}")
@@ -538,24 +660,48 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
         if msg is None: return None
         df = msg.payload().df; source_col = "source" if "source" in df.columns else "hostname" if "hostname" in df.columns else "host" if "host" in df.columns else None
         if not source_col: return msg
-        counts = df[source_col].value_counts(); active_hosts = counts[counts >= 100].index.to_arrow().to_pylist()
-        if not active_hosts: return msg
-        pdf = df[df[source_col].isin(active_hosts)].to_pandas()
-        for user_id in active_hosts:
+        # Only train on rows Triton successfully classified; rows with Triton down have
+        # all Triton-derived features zeroed out and would corrupt the model baseline.
+        train_df = df[df["triton_classified"] == True] if "triton_classified" in df.columns else df
+        if len(train_df) == 0: return msg
+
+        # Append this batch's classified feature vectors to each host's rolling window.
+        # Training then uses the full window, not just the current 2-second batch.
+        batch_pdf = train_df[[source_col] + FEATURE_COLS].to_pandas()
+        with ROLLING_WINDOW_LOCK:
+            for uid, group in batch_pdf.groupby(source_col):
+                new_rows = group[FEATURE_COLS]
+                if uid in ROLLING_WINDOW_CACHE:
+                    ROLLING_WINDOW_CACHE[uid] = pd.concat(
+                        [ROLLING_WINDOW_CACHE[uid], new_rows], ignore_index=True
+                    ).tail(ROLLING_WINDOW_MAX_ROWS)
+                else:
+                    ROLLING_WINDOW_CACHE[uid] = new_rows.reset_index(drop=True)
+
+        counts = train_df[source_col].value_counts()
+        # Require at least 100 rows in the rolling window (not just this batch) before training
+        with ROLLING_WINDOW_LOCK:
+            eligible = [uid for uid in ROLLING_WINDOW_CACHE if len(ROLLING_WINDOW_CACHE[uid]) >= 100]
+        if not eligible: return msg
+
+        for user_id in eligible:
             if pytime.time() - self._last_train_time.get(user_id, 0) < 60: continue
             with TRAINING_SET_LOCK:
                 if user_id in TRAINING_IN_PROGRESS: continue
             if not self._queue_semaphore.acquire(blocking=False): continue
-            
-            # Per-host versioning: increment from last known version for this specific host
-            with MODEL_CACHE_LOCK: 
+
+            with MODEL_CACHE_LOCK:
                 self._train_counter[user_id] = self._train_counter.get(user_id, GLOBAL_TRAIN_COUNTER.get(user_id, 0)) + 1
-            
-            count = self._train_counter[user_id]; logger.info(f"⚡ TRAINING START: Host {user_id} ({counts[user_id]}) - V{count}")
+            count = self._train_counter[user_id]
+
+            with ROLLING_WINDOW_LOCK:
+                window_snapshot = ROLLING_WINDOW_CACHE[user_id].copy()
+
+            logger.info(f"⚡ TRAINING START: Host {user_id} (window={len(window_snapshot)}) - V{count}")
             self._last_train_time[user_id] = pytime.time()
-            with TRAINING_SET_LOCK: 
+            with TRAINING_SET_LOCK:
                 TRAINING_IN_PROGRESS.add(user_id)
-            user_data = pdf[pdf[source_col] == user_id].copy(); TRAINING_EXECUTOR.submit(self._train_and_save, user_data, user_id, count)
+            TRAINING_EXECUTOR.submit(self._train_and_save, window_snapshot, user_id, count)
         return msg
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
@@ -640,12 +786,22 @@ class ManualInferenceStage(SinglePortStage):
             
             with torch.no_grad():
                 abs_errors = torch.abs(normalized_input - reconstruction)
-                max_err, max_indices = torch.max(abs_errors, dim=1)
+                max_err = torch.max(abs_errors, dim=1).values
                 mean_err = torch.mean(abs_errors, dim=1)
-                
+
                 # BLENDED LOSS (0.7 MAE + 0.3 MAX): Captures both general drift and extreme spikes
                 loss_f32 = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
-                reason_codes = max_indices.cpu().numpy()
+
+                # RELATIVE REASON ATTRIBUTION: Raw argmax always picks time features
+                # because sin/cos cyclical encoding has inherently high reconstruction
+                # error (autoencoder can't enforce sin²+cos²=1). Normalize each
+                # feature's error by its batch baseline so the reason reflects which
+                # feature is most *unusual*, not just highest raw error.
+                feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
+                feat_iqr = (torch.quantile(abs_errors, 0.75, dim=0) - torch.quantile(abs_errors, 0.25, dim=0)).unsqueeze(0).clamp(min=0.01)
+                relative_errors = (abs_errors - feat_median) / feat_iqr
+                _, reason_indices = torch.max(relative_errors, dim=1)
+                reason_codes = reason_indices.cpu().numpy()
             
             # DEFINE LEARNING STATE: Host is new or model is too immature (less than 5 training cycles)
             batch_v = self.gpu_versions[stats_ids].cpu().numpy()
@@ -700,36 +856,62 @@ class ManualInferenceStage(SinglePortStage):
             big_df.loc[is_learning_gdf, "anomaly_cause"] = "Learning..."
             
             new_meta = MessageMeta(big_df); self._gc_anchor.append(new_meta); return new_meta
-        except Exception as e: logger.error(f"❌ Inference Flush Error: {e}"); self._buffer = []; self._buffer_count = 0; return None
+        except Exception as e: logger.error(f"❌ Inference Error: {e}"); return None
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
 
 @register_stage("python-kafka-sink")
 class PythonKafkaSink(SinglePortStage):
     def __init__(self, c, bootstrap_servers, output_topic):
-        super().__init__(c); self._producer = Producer({'bootstrap.servers': bootstrap_servers, 'linger.ms': 100, 'compression.type': 'snappy'})
+        super().__init__(c)
         self._topic = output_topic
+        self._producer = Producer({
+            'bootstrap.servers': bootstrap_servers,
+            'linger.ms': 100,
+            'compression.type': 'snappy',
+            'on_delivery': self._delivery_callback,
+        })
+
+    @staticmethod
+    def _delivery_callback(err, msg):
+        if err:
+            logger.error(f"❌ Kafka delivery failure: topic={msg.topic()} partition={msg.partition()} error={err}")
+
+    def __del__(self):
+        try: self._producer.flush(timeout=30)
+        except Exception: pass
+
     @property
     def name(self): return "python-kafka-sink"
     def accepted_types(self): return (MessageMeta,)
     def supports_cpp_node(self): return False
     def compute_schema(self, schema): schema.output_schema.set_type(MessageMeta); return schema
+
     def _process(self, msg: MessageMeta):
         if msg is None: return None
         try:
             with msg.mutable_dataframe() as df:
-                # OPTIMIZATION: Use to_json() with lines=True for faster serialization
                 pdf = df.to_pandas()
                 keys = pdf['source'].values
                 json_batch = pdf.to_json(orient='records', lines=True, date_format='iso')
-                
                 for key, line in zip(keys, json_batch.splitlines()):
-                    if line:
-                        # KEYED PRODUCTION: Ensures host-stickiness across partitions
-                        self._producer.produce(self._topic, value=line.encode('utf-8'), key=str(key).encode('utf-8'))
+                    if not line:
+                        continue
+                    # Retry once on BufferError (producer queue full under load burst)
+                    for attempt in range(2):
+                        try:
+                            self._producer.produce(self._topic, value=line.encode('utf-8'), key=str(key).encode('utf-8'))
+                            break
+                        except BufferError:
+                            if attempt == 0:
+                                self._producer.poll(1)
+                            else:
+                                logger.warning(f"⚠️ Kafka producer queue full — dropping message for key={key}")
                 self._producer.poll(0)
-        except Exception as e: logger.error(f"❌ Kafka Sink Error: {e}")
+        except Exception as e:
+            logger.error(f"❌ Kafka Sink Error: {e}")
         return msg
+
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
 
@@ -823,45 +1005,40 @@ class StringTritonInferenceStage(SinglePortStage):
 
     def _process(self, msg: ControlMessage):
         if msg is None: return None
-        if self._ensure_client():
-            try:
-                meta = msg.payload()
-                with meta.mutable_dataframe() as df:
+        # Single mutable_dataframe() context: set triton_classified=False as default,
+        # overwrite with True only after a successful Triton response.  Calling
+        # mutable_dataframe() twice on the same MessageMeta in the same invocation is
+        # fragile in Morpheus 25.x and was the likely cause of the column-size mismatch.
+        with msg.payload().mutable_dataframe() as df:
+            df["triton_classified"] = False
+            if self._ensure_client():
+                try:
                     batch_size = len(df)
-                    
-                    # DEBUG: Throttled Logging (Every 100 batches)
                     do_log = (self._debug_counter % 100 == 0)
                     self._debug_counter += 1
-                    
                     if do_log:
                         logger.info(f"🔵 TRITON CALL: model={self._model_name}, batch_size={batch_size}")
-                    
-                    # to_pandas() is required for strings as to_arrow() often enforces zero_copy_only
+                    # to_pandas() is required for strings as to_arrow() enforces zero_copy_only
                     msg_array = df["message"].to_pandas().values.astype(object).reshape(-1, 1)
-                    
                     from tritonclient.grpc import InferInput, InferRequestedOutput
                     inputs = [InferInput("input_message", msg_array.shape, "BYTES")]
                     inputs[0].set_data_from_numpy(msg_array)
                     outputs = [InferRequestedOutput(out.name) for out in self.output_mapping]
-                    
                     response = self._client.infer(self._model_name, inputs, outputs=outputs)
-                    
                     if do_log:
                         samples = min(3, batch_size)
                         for i in range(samples):
                             msg_peek = str(msg_array[i][0])[:60].replace("\n", " ")
                             results_peek = {out.name: response.as_numpy(out.name)[i] for out in self.output_mapping}
                             logger.info(f"   Sample {i}: '{msg_peek}...' -> {results_peek}")
-
                     for out in self.output_mapping:
                         result = response.as_numpy(out.name)
                         if result is not None:
-                            # OPTIMIZATION: Assign numpy array directly to cudf (Zero-copy where possible)
                             df[out.name] = result.flatten()
-                            # CRITICAL: Map to feature column so ManualInferenceStage can see it!
                             df[f"feature_{out.name}"] = df[out.name].astype("float32")
-            except Exception as e:
-                logger.error(f"❌ Triton inference failed: {e}")
+                    df["triton_classified"] = True
+                except Exception as e:
+                    logger.error(f"❌ Triton inference failed: {e}")
         return msg
 
     def _build_single(self, builder, input_node):
@@ -872,14 +1049,17 @@ class StringTritonInferenceStage(SinglePortStage):
 def run_inference_pipeline():
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR, exist_ok=True)
     os.environ["MLFLOW_TRACKING_URI"] = f"file://{MODEL_DIR}"
+    # Health server must start first so K8s startup probes get responses
+    # during the entire warm-up and CUDA init window.
+    threading.Thread(target=run_health_server, daemon=True).start()
+    pytime.sleep(1)  # give uvicorn a moment to bind before probes can fire
     warm_up_model_cache()
     threading.Thread(target=memory_manager_worker, daemon=True).start()
     threading.Thread(target=model_janitor_worker, daemon=True).start()
-    threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=control_worker, daemon=True).start()
     while True:
         try:
-            config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = 32768; config.edge_buffer_size = 32768; config.mode = "AE"; config.num_threads = 8
+            config = Config(); config.execution_mode = ExecutionMode.GPU; config.pipeline_batch_size = kafka_batch_size; config.edge_buffer_size = kafka_edge_buffer; config.mode = "AE"; config.num_threads = 8
             KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
             KAFKA_GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "morpheus_syslog_dfp_v1")
             INPUT_TOPIC = os.environ.get("INPUT_TOPIC", "kafka_input")

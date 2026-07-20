@@ -1,6 +1,9 @@
-dfp-models/*
+.env
+dfp-models/
 *.bak
 *.tmp
 ingest-syslog/
 GEMINI.md
 CLAUDE.md
+**/__pycache__/
+**.pytest_cache/
