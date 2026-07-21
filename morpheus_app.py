@@ -101,9 +101,29 @@ except ImportError:
 
 # FastAPI for Health Checks
 from fastapi import FastAPI, Response, status
+from prometheus_client import make_asgi_app, Counter, Histogram
 import uvicorn
 
+PIPELINE_EVENTS_PROCESSED = Counter(
+    'morpheus_pipeline_events_processed_total', 
+    'Total events processed by the Morpheus pipeline',
+    ['pipeline_type']
+)
+
+PIPELINE_ANOMALY_LOSS = Histogram(
+    'morpheus_pipeline_anomaly_loss',
+    'Distribution of AutoEncoder reconstruction loss (RawLoss)',
+    ['pipeline_type'],
+    buckets=(1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, float("inf"))
+)
+
 app = FastAPI()
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
+# Initialize metrics so they appear in output even before data is processed
+PIPELINE_EVENTS_PROCESSED.labels(pipeline_type="syslog").inc(0)
+PIPELINE_ANOMALY_LOSS.labels(pipeline_type="syslog")
 PIPELINE_HEALTH = {
     "status": "starting",
     "last_activity": pytime.time(),
@@ -412,6 +432,7 @@ class AccumulatorStage(SinglePortStage):
         if msg is None: return None
         PIPELINE_HEALTH["last_activity"] = pytime.time(); PIPELINE_HEALTH["is_running"] = True; PIPELINE_HEALTH["status"] = "processing"
         gdf = msg.payload().df; self._buffer.append(gdf); self._count += len(gdf); self._perf_window_count += len(gdf)
+        PIPELINE_EVENTS_PROCESSED.labels(pipeline_type="syslog").inc(len(gdf))
         now = pytime.time()
         if self._count < self.batch_size and (now - self._last_flush < self.max_latency) and self._count < self.max_buffer_size: return None 
         try:
@@ -809,6 +830,10 @@ class ManualInferenceStage(SinglePortStage):
             
             scores_cp = cp.asarray(loss_f32)
             is_learning_cp = cp.asarray(is_learning)
+            
+            if len(big_df) > 0:
+                batch_avg_raw_loss = float(cp.mean(scores_cp))
+                PIPELINE_ANOMALY_LOSS.labels(pipeline_type="syslog").observe(batch_avg_raw_loss)
             
             # DIAGNOSTIC LOGGING (Throttled): See why scores are hitting 0 or 10
             if len(big_df) > 0 and self._debug_counter % 50 == 0:

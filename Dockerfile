@@ -7,6 +7,7 @@ WORKDIR /app
 RUN conda install -y -c nvidia -c rapidsai -c conda-forge \
     morpheus-dfp=25.06 \
     mlflow \
+    prometheus_client \
     && conda clean --all -f -y
 
 COPY morpheus_app.py .
