@@ -4,13 +4,14 @@
 import os
 import logging
 import joblib
+import pickle
 import pandas as pd
 import numpy as np
 import warnings
 import uuid
 import shutil
 import time as pytime
-from concurrent.futures import ThreadPoolExecutor 
+from concurrent.futures import ThreadPoolExecutor
 import collections
 import threading
 import gc
@@ -352,6 +353,19 @@ def warm_up_model_cache():
                     GLOBAL_MODEL_CACHE[user_id] = loaded
                     GLOBAL_TRAIN_COUNTER[user_id] = latest_v_num
                     count += 1
+
+                    # Restore rolling window snapshot so the host immediately
+                    # re-qualifies for training without re-accumulating from zero.
+                    snapshot_path = os.path.join(host_path, "window_snapshot.pkl")
+                    if os.path.exists(snapshot_path):
+                        try:
+                            with open(snapshot_path, "rb") as sf:
+                                snap_df = pickle.load(sf)
+                            if isinstance(snap_df, pd.DataFrame) and len(snap_df) > 0:
+                                with ROLLING_WINDOW_LOCK:
+                                    ROLLING_WINDOW_CACHE[user_id] = snap_df
+                        except Exception as snap_err:
+                            logger.warning(f"Could not restore window snapshot for {user_id}: {snap_err}")
             except Exception as e:
                 logger.warning(f"Error loading model for {user_id}: {e}")
     except Exception as e:
@@ -670,7 +684,20 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
                             os.remove(os.path.join(host_dir, f))
                 except Exception as e:
                     logger.warning(f"Version pruning error for {user_id}: {e}")
-                
+
+                # ROLLING WINDOW SNAPSHOT: Persist the last 1 000 rows so the
+                # host immediately re-qualifies for training after a restart.
+                try:
+                    with ROLLING_WINDOW_LOCK:
+                        snap = ROLLING_WINDOW_CACHE.get(user_id)
+                    if snap is not None and len(snap) > 0:
+                        snap_tail = snap.tail(1000).reset_index(drop=True)
+                        snap_path = os.path.join(host_dir, "window_snapshot.pkl")
+                        with open(snap_path, "wb") as sf:
+                            pickle.dump(snap_tail, sf, protocol=pickle.HIGHEST_PROTOCOL)
+                except Exception as snap_err:
+                    logger.warning(f"Could not save window snapshot for {user_id}: {snap_err}")
+
                 MODEL_UPDATED_EVENT.set(); logger.info(f"💾 SAVED: Host {user_id} Version {count} (Lightweight)")
         except Exception as e: logger.error(f"❌ Training Thread Error for {user_id}: {e}")
         finally:
@@ -729,9 +756,20 @@ class AsyncTrainingStage(PassThruTypeMixin, SinglePortStage):
 
 @register_stage("manual-inference")
 class ManualInferenceStage(SinglePortStage):
+    # Time features (indices 4-7) are excluded from scoring and reason attribution.
+    # The autoencoder cannot learn to reconstruct sin/cos time encoding — it trains
+    # on logs from many hours so it learns the mean, which is wrong for every specific
+    # hour. Time features stay in the training vector (the bottleneck still captures
+    # time-correlated behavior) but contribute zero to scores and reasons.
+    TIME_FEATURE_INDICES = {4, 5, 6, 7}
+    FEATURE_WEIGHTS = [1.0] * NUM_FEATURES
+    for _ti in TIME_FEATURE_INDICES:
+        FEATURE_WEIGHTS[_ti] = 0.0
+
     def __init__(self, c):
-        super().__init__(c); self._debug_counter = 0; self._gc_anchor = collections.deque(maxlen=5) 
-        self._last_reload = pytime.time(); self._min_reload_cooldown = 120.0 
+        super().__init__(c); self._debug_counter = 0; self._gc_anchor = collections.deque(maxlen=5)
+        self._last_reload = pytime.time(); self._min_reload_cooldown = 30.0
+        self._feature_weights = torch.tensor(self.FEATURE_WEIGHTS, device="cuda", dtype=torch.float32)
         self._build_gpu_lookups()
     def _build_gpu_lookups(self):
         logger.info(f"⏳ RELOAD: Syncing GPU from Global Cache...")
@@ -807,26 +845,31 @@ class ManualInferenceStage(SinglePortStage):
             
             with torch.no_grad():
                 abs_errors = torch.abs(normalized_input - reconstruction)
-                max_err = torch.max(abs_errors, dim=1).values
-                mean_err = torch.mean(abs_errors, dim=1)
+
+                # Exclude time features from both scoring and reason attribution.
+                weighted_errors = abs_errors * self._feature_weights
+                max_err = torch.max(weighted_errors, dim=1).values
+                mean_err = torch.mean(weighted_errors, dim=1)
 
                 # BLENDED LOSS (0.7 MAE + 0.3 MAX): Captures both general drift and extreme spikes
                 loss_f32 = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
 
-                # RELATIVE REASON ATTRIBUTION: Raw argmax always picks time features
-                # because sin/cos cyclical encoding has inherently high reconstruction
-                # error (autoencoder can't enforce sin²+cos²=1). Normalize each
-                # feature's error by its batch baseline so the reason reflects which
-                # feature is most *unusual*, not just highest raw error.
+                # REASON ATTRIBUTION: Use relative error on non-time features only.
+                # Time features are masked to -inf so they can never be selected.
                 feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
                 feat_iqr = (torch.quantile(abs_errors, 0.75, dim=0) - torch.quantile(abs_errors, 0.25, dim=0)).unsqueeze(0).clamp(min=0.01)
                 relative_errors = (abs_errors - feat_median) / feat_iqr
+                relative_errors[:, 4] = float('-inf')
+                relative_errors[:, 5] = float('-inf')
+                relative_errors[:, 6] = float('-inf')
+                relative_errors[:, 7] = float('-inf')
                 _, reason_indices = torch.max(relative_errors, dim=1)
                 reason_codes = reason_indices.cpu().numpy()
             
-            # DEFINE LEARNING STATE: Host is new or model is too immature (less than 5 training cycles)
+            # DEFINE LEARNING STATE: Host is new (no model) or untrained (version 0).
+            # Version >= 1 means a model exists and has been fit at least once — score it.
             batch_v = self.gpu_versions[stats_ids].cpu().numpy()
-            is_learning = (stats_ids == 0).cpu().numpy() | (batch_v < 5)
+            is_learning = (stats_ids == 0).cpu().numpy() | (batch_v < 1)
             
             scores_cp = cp.asarray(loss_f32)
             is_learning_cp = cp.asarray(is_learning)
@@ -884,6 +927,205 @@ class ManualInferenceStage(SinglePortStage):
         except Exception as e: logger.error(f"❌ Inference Error: {e}"); return None
     def _build_single(self, builder, input_node):
         node = builder.make_node(self.unique_name, ops.map(self._process)); builder.make_edge(input_node, node); return node
+
+@register_stage("threat-pattern")
+class ThreatPatternStage(PassThruTypeMixin, SinglePortStage):
+    """Maintains a per-host sliding window of recent anomaly causes and scores,
+    then matches known attack patterns to produce a 'threat_context' field.
+    Lightweight CPU work — no GPU tensors, just dict lookups on the batch."""
+
+    WINDOW_SECONDS = 300  # 5-minute lookback
+    MAX_WINDOW_SIZE = 200
+
+    # Each pattern: (name, description, matcher_fn)
+    # matcher_fn receives (reasons: Counter, scores: list, window_size: int)
+    # and returns True if the pattern matches.
+    PATTERNS = []
+
+    def __init__(self, c):
+        super().__init__(c)
+        # {source: deque of (timestamp, score, reason)}
+        self._windows = collections.defaultdict(collections.deque)
+
+    @property
+    def name(self): return "threat-pattern"
+    def accepted_types(self): return (MessageMeta,)
+    def supports_cpp_node(self): return False
+    def compute_schema(self, schema): schema.output_schema.set_type(MessageMeta); return schema
+
+    @staticmethod
+    def _define_patterns():
+        """Pattern definitions. Each returns (label, description, confidence) or None.
+        Confidence is 0.0–1.0 based on how far the signal exceeds the threshold."""
+        patterns = []
+
+        def brute_force(reasons, _scores, n):
+            sec_count = reasons.get("Security Flag", 0)
+            ratio = sec_count / max(n, 1)
+            if sec_count >= 5 and ratio > 0.3:
+                conf = min(1.0, 0.4 + (sec_count - 5) * 0.06 + (ratio - 0.3) * 1.0)
+                return ("Brute Force Attack",
+                        f"{sec_count} security events in window — repeated authentication failures indicate credential stuffing or brute force",
+                        round(conf, 2))
+            return None
+        patterns.append(brute_force)
+
+        def lateral_movement(reasons, _scores, _n):
+            user_count = reasons.get("User Anomaly", 0)
+            sec_count = reasons.get("Security Flag", 0)
+            proc_count = reasons.get("Process Anomaly", 0)
+            if user_count >= 2 and (sec_count >= 1 or proc_count >= 1):
+                signals = min(user_count, 5) + min(sec_count, 3) + min(proc_count, 3)
+                conf = min(1.0, 0.3 + signals * 0.07)
+                return ("Lateral Movement",
+                        "New user accounts with security events or unfamiliar processes — possible attacker pivoting through the network",
+                        round(conf, 2))
+            return None
+        patterns.append(lateral_movement)
+
+        def service_install(reasons, _scores, _n):
+            proc_count = reasons.get("Process Anomaly", 0)
+            content_count = reasons.get("Log Content Anomaly", 0)
+            volume_count = reasons.get("Volume Anomaly", 0)
+            if proc_count >= 2 and (content_count >= 3 or volume_count >= 1):
+                signals = min(proc_count, 6) + min(content_count, 8) + min(volume_count, 4)
+                conf = min(1.0, 0.3 + signals * 0.05)
+                return ("New Service Detected",
+                        "New processes generating unfamiliar log patterns with volume changes — a new service or application has been installed",
+                        round(conf, 2))
+            return None
+        patterns.append(service_install)
+
+        def data_exfiltration(reasons, scores, _n):
+            vol_count = reasons.get("Volume Anomaly", 0)
+            high_scores = sum(1 for s in scores if s > 6.0)
+            if vol_count >= 3 and high_scores >= 3:
+                conf = min(1.0, 0.4 + (vol_count - 3) * 0.08 + (high_scores - 3) * 0.08)
+                return ("Possible Data Exfiltration",
+                        f"Sustained volume spikes with {high_scores} critical-severity scores — abnormal data transfer pattern",
+                        round(conf, 2))
+            return None
+        patterns.append(data_exfiltration)
+
+        def privilege_escalation(reasons, scores, _n):
+            user_count = reasons.get("User Anomaly", 0)
+            sec_count = reasons.get("Security Flag", 0)
+            high_scores = sum(1 for s in scores if s > 7.0)
+            if user_count >= 1 and sec_count >= 2 and high_scores >= 2:
+                conf = min(1.0, 0.5 + (sec_count - 2) * 0.1 + (high_scores - 2) * 0.1)
+                return ("Privilege Escalation Attempt",
+                        "Unknown users triggering high-severity security events — possible privilege escalation or unauthorized access",
+                        round(conf, 2))
+            return None
+        patterns.append(privilege_escalation)
+
+        def crypto_mining(reasons, _scores, _n):
+            proc_count = reasons.get("Process Anomaly", 0)
+            vol_count = reasons.get("Volume Anomaly", 0)
+            if proc_count >= 2 and vol_count >= 2 and not reasons.get("Security Flag", 0):
+                conf = min(1.0, 0.3 + (proc_count - 2) * 0.1 + (vol_count - 2) * 0.1)
+                return ("Suspicious Process Activity",
+                        "New high-volume processes without security flags — possible crypto miner, unauthorized daemon, or resource hijacking",
+                        round(conf, 2))
+            return None
+        patterns.append(crypto_mining)
+
+        def behavioral_drift(reasons, _scores, n):
+            distinct = sum(1 for v in reasons.values() if v >= 2)
+            if distinct >= 4 and n >= 10:
+                conf = min(1.0, 0.4 + (distinct - 4) * 0.15 + (n - 10) * 0.01)
+                return ("Major Behavioral Shift",
+                        f"{distinct} distinct anomaly categories active — host behavior has fundamentally changed from its learned baseline",
+                        round(conf, 2))
+            return None
+        patterns.append(behavioral_drift)
+
+        return patterns
+
+    def _evaluate_host(self, source, now):
+        """Evaluate all patterns for a host and return the best match."""
+        window = self._windows.get(source)
+        if not window:
+            return None, None, 0.0
+
+        # Prune old entries
+        cutoff = now - self.WINDOW_SECONDS
+        while window and window[0][0] < cutoff:
+            window.popleft()
+
+        if len(window) < 3:
+            return None, None, 0.0
+
+        reasons = collections.Counter(entry[2] for entry in window)
+        scores = [entry[1] for entry in window]
+        n = len(window)
+
+        matches = []
+        for pattern_fn in self.PATTERNS:
+            result = pattern_fn(reasons, scores, n)
+            if result:
+                matches.append(result)
+
+        if not matches:
+            return None, None, 0.0
+
+        # Pick the highest-confidence match
+        best = max(matches, key=lambda m: m[2])
+        return best
+
+    def _process(self, msg: MessageMeta):
+        if msg is None:
+            return None
+        try:
+            with msg.mutable_dataframe() as df:
+                now = pytime.time()
+                sources = df["source"].to_pandas().values
+                scores = df["anomaly_score"].to_pandas().values
+                causes = df["anomaly_cause"].to_pandas().values
+
+                # Update windows for hosts with actual anomalies
+                for i in range(len(sources)):
+                    score = float(scores[i])
+                    cause = str(causes[i])
+                    if score > 2.0 and cause != "Learning...":
+                        src = str(sources[i])
+                        window = self._windows[src]
+                        window.append((now, score, cause))
+                        # Cap window size
+                        while len(window) > self.MAX_WINDOW_SIZE:
+                            window.popleft()
+
+                # Evaluate patterns for each unique source in this batch
+                context_labels = []
+                context_descriptions = []
+                context_confidences = []
+                unique_sources = {}
+                for src in set(sources):
+                    label, desc, conf = self._evaluate_host(str(src), now)
+                    unique_sources[str(src)] = (label or "", desc or "", conf)
+
+                for src in sources:
+                    entry = unique_sources.get(str(src), ("", "", 0.0))
+                    context_labels.append(entry[0])
+                    context_descriptions.append(entry[1])
+                    context_confidences.append(entry[2])
+
+                df["threat_context"] = context_labels
+                df["threat_description"] = context_descriptions
+                df["threat_confidence"] = context_confidences
+
+        except Exception as e:
+            logger.error(f"ThreatPattern Error: {e}")
+        return msg
+
+    def _build_single(self, builder, input_node):
+        node = builder.make_node(self.unique_name, ops.map(self._process))
+        builder.make_edge(input_node, node)
+        return node
+
+# Initialize patterns once at class definition time
+ThreatPatternStage.PATTERNS = ThreatPatternStage._define_patterns()
+
 
 @register_stage("python-kafka-sink")
 class PythonKafkaSink(SinglePortStage):
@@ -1109,6 +1351,7 @@ def run_inference_pipeline():
             
             pipeline.add_stage(AsyncTrainingStage(config))
             pipeline.add_stage(ManualInferenceStage(config))
+            pipeline.add_stage(ThreatPatternStage(config))
             pipeline.add_stage(PythonKafkaSink(config, bootstrap_servers=KAFKA_BROKER, output_topic=OUTPUT_TOPIC))
             logger.info("🚀 Morpheus DFP Inference Pipeline starting..."); PIPELINE_HEALTH["status"] = "running"; pipeline.run()
         except Exception as e: logger.critical(f"🛑 FATAL PIPELINE ERROR: {e}"); PIPELINE_HEALTH["status"] = "error"; pytime.sleep(10)
