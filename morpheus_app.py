@@ -476,6 +476,12 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
         # RFC NILVALUE ("-") is treated as "no hostname" rather than captured.
         self._rfc5424_host_regex = r"(?:<\d+>)\d+\s+\S+\s+([A-Za-z0-9][A-Za-z0-9\.\-_]*)"
         self._rfc5424_ts_regex = r"(?:<\d+>)\d+\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+        # FortiOS key=value logs (not RFC 3164/5424): the origin host is devname, the
+        # stable serial is devid, and eventtime is a Unix-epoch (seconds) event time.
+        # "?  makes the surrounding quotes optional so quoted and unquoted values both match.
+        self._forti_devname_regex = r'devname="?([A-Za-z0-9\.\-_]+)'
+        self._forti_devid_regex = r'devid="?([A-Za-z0-9\.\-_]+)'
+        self._forti_eventtime_regex = r'eventtime=(\d+)'
     @property
     def name(self): return "gpu-preprocessing"
     def accepted_types(self): return (ControlMessage,)
@@ -488,15 +494,26 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                 now = datetime.utcnow()
                 if "message" in df.columns:
                     msg_col = df["message"]
-                    # Hostname is the RFC-defined origin field: RFC 3164 group 2 (after the
-                    # "Mmm dd hh:mm:ss" timestamp), else the RFC 5424 HOSTNAME field. Prefer it
-                    # over an in-message "from <IP>" clause, which is usually a *peer* address,
-                    # not the log origin — so a host keys on one stable identity, not a split
-                    # between its hostname and every remote IP that appears in its logs.
+                    # Host identity, in priority order:
+                    #   1. FortiOS devname / devid (key=value logs — no positional hostname)
+                    #   2. RFC 3164 hostname (group 2, after the "Mmm dd hh:mm:ss" timestamp)
+                    #   3. RFC 5424 HOSTNAME field
+                    #   4. in-message "from <IP>" — usually a *peer* address, not the origin
+                    # Preferring the device/host fields over the peer IP keeps a host on one
+                    # stable identity instead of splitting across every remote IP in its logs.
+                    extracted_devname = msg_col.str.extract(self._forti_devname_regex, expand=True)[0]
+                    extracted_devid = msg_col.str.extract(self._forti_devid_regex, expand=True)[0]
                     extracted_host = msg_col.str.extract(self._host_regex, expand=True)[1]
                     extracted_host_5424 = msg_col.str.extract(self._rfc5424_host_regex, expand=True)[0]
                     extracted_ip = msg_col.str.extract(self._ip_regex, expand=True)[0]
-                    df["source"] = extracted_host.fillna(extracted_host_5424).fillna(extracted_ip).fillna("unknown_source")
+                    df["source"] = (
+                        extracted_devname
+                        .fillna(extracted_devid)
+                        .fillna(extracted_host)
+                        .fillna(extracted_host_5424)
+                        .fillna(extracted_ip)
+                        .fillna("unknown_source")
+                    )
                     df["feature_msg_len"] = (msg_col.str.len() / 512.0).astype("float32").clip(0.0, 1.0)
                     users = msg_col.str.extract(self._user_regex, expand=True)[0].fillna("none")
                     procs = msg_col.str.extract(self._process_regex, expand=True)[0].fillna("unknown")
@@ -528,7 +545,18 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                         ts_5424_pd, format="%Y-%m-%dT%H:%M:%S", errors='coerce'
                     )
 
-                    combined_ts = parsed_3164_pd.fillna(parsed_5424_pd).fillna(pd.Timestamp(now))
+                    # FortiOS: "eventtime=1784823567" — Unix epoch seconds, timezone-unambiguous.
+                    ts_epoch_pd = msg_pd.str.extract(self._forti_eventtime_regex, expand=True)[0]
+                    parsed_epoch_pd = pd.to_datetime(
+                        pd.to_numeric(ts_epoch_pd, errors='coerce'), unit='s', errors='coerce'
+                    )
+
+                    combined_ts = (
+                        parsed_3164_pd
+                        .fillna(parsed_5424_pd)
+                        .fillna(parsed_epoch_pd)
+                        .fillna(pd.Timestamp(now))
+                    )
                     # Assign via numpy array (no pandas index) so cuDF assigns by position
                     df["timestamp"] = cudf.Series(combined_ts.values.astype("datetime64[ns]"))
                 else:
