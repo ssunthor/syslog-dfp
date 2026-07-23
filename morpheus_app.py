@@ -469,7 +469,12 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
         self._host_regex = r"(?:<\d+>)?([A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+([a-zA-Z0-9\.\-_]+)"
         self._user_regex = r"(?:user|for user|User|User=)\s*([a-zA-Z0-9\.\-_]+)"
         self._process_regex = r"(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d+\s\d+:\d+:\d+)\s+[a-zA-Z0-9\.\-_]+\s+([a-zA-Z0-9\.\-_]+)(?:\[\d+\])?: "
-        # RFC 5424: <PRI>VERSION ISO-TIMESTAMP hostname ...
+        # RFC 5424: <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME ...
+        # PRI + version digits distinguish 5424 from 3164 (which has a month name here);
+        # \S+ consumes the whole timestamp token (fractional secs / TZ and all) up to the
+        # space before HOSTNAME. The hostname group requires a leading alphanumeric so the
+        # RFC NILVALUE ("-") is treated as "no hostname" rather than captured.
+        self._rfc5424_host_regex = r"(?:<\d+>)\d+\s+\S+\s+([A-Za-z0-9][A-Za-z0-9\.\-_]*)"
         self._rfc5424_ts_regex = r"(?:<\d+>)\d+\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
     @property
     def name(self): return "gpu-preprocessing"
@@ -483,9 +488,15 @@ class GPUPreprocessingStage(PassThruTypeMixin, SinglePortStage):
                 now = datetime.utcnow()
                 if "message" in df.columns:
                     msg_col = df["message"]
+                    # Hostname is the RFC-defined origin field: RFC 3164 group 2 (after the
+                    # "Mmm dd hh:mm:ss" timestamp), else the RFC 5424 HOSTNAME field. Prefer it
+                    # over an in-message "from <IP>" clause, which is usually a *peer* address,
+                    # not the log origin — so a host keys on one stable identity, not a split
+                    # between its hostname and every remote IP that appears in its logs.
                     extracted_host = msg_col.str.extract(self._host_regex, expand=True)[1]
+                    extracted_host_5424 = msg_col.str.extract(self._rfc5424_host_regex, expand=True)[0]
                     extracted_ip = msg_col.str.extract(self._ip_regex, expand=True)[0]
-                    df["source"] = extracted_ip.fillna(extracted_host).fillna("unknown_source")
+                    df["source"] = extracted_host.fillna(extracted_host_5424).fillna(extracted_ip).fillna("unknown_source")
                     df["feature_msg_len"] = (msg_col.str.len() / 512.0).astype("float32").clip(0.0, 1.0)
                     users = msg_col.str.extract(self._user_regex, expand=True)[0].fillna("none")
                     procs = msg_col.str.extract(self._process_regex, expand=True)[0].fillna("unknown")
