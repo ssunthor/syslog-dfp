@@ -239,27 +239,41 @@ for _ri in range(11, NUM_FEATURES):
 
 
 def attribute_reason(abs_errors: torch.Tensor) -> np.ndarray:
+<<<<<<< HEAD
     """Replica of ManualInferenceStage relative-error reason attribution.
     Time features (indices 4-7) are masked to -inf so they can never be selected."""
+=======
+    """Replica of ManualInferenceStage relative-error reason attribution."""
+>>>>>>> origin/dev
     feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
     feat_iqr = (
         torch.quantile(abs_errors, 0.75, dim=0)
         - torch.quantile(abs_errors, 0.25, dim=0)
     ).unsqueeze(0).clamp(min=0.01)
     relative_errors = (abs_errors - feat_median) / feat_iqr
+<<<<<<< HEAD
     relative_errors[:, 4] = float('-inf')
     relative_errors[:, 5] = float('-inf')
     relative_errors[:, 6] = float('-inf')
     relative_errors[:, 7] = float('-inf')
+=======
+>>>>>>> origin/dev
     _, reason_indices = torch.max(relative_errors, dim=1)
     return reason_indices.numpy()
 
 
 def _baseline_errors(batch_size: int = 200) -> torch.Tensor:
     """Generate realistic baseline reconstruction errors: time features have
+<<<<<<< HEAD
     higher raw error but are excluded from scoring and reason attribution."""
     errors = torch.rand(batch_size, NUM_FEATURES) * 0.3
     errors[:, 4] += 0.8  # hour_sin (excluded from scoring/reasons)
+=======
+    higher raw error (the exact problem the relative attribution fixes)."""
+    errors = torch.rand(batch_size, NUM_FEATURES) * 0.3
+    # Simulate the autoencoder's inherently higher error on cyclical features
+    errors[:, 4] += 0.8  # hour_sin
+>>>>>>> origin/dev
     errors[:, 5] += 0.7  # hour_cos
     errors[:, 6] += 0.5  # day_sin
     errors[:, 7] += 0.5  # day_cos
@@ -268,6 +282,7 @@ def _baseline_errors(batch_size: int = 200) -> torch.Tensor:
 
 @pytest.mark.torch
 @requires_torch
+<<<<<<< HEAD
 class TestFeatureWeightedScoring:
     """Verify that time features are down-weighted in the anomaly score."""
 
@@ -315,16 +330,28 @@ class TestFeatureWeightedScoring:
 
 @pytest.mark.torch
 @requires_torch
+=======
+>>>>>>> origin/dev
 class TestReasonAttribution:
     """Verify that relative-error reason attribution correctly identifies every
     feature as the anomaly cause when that feature has an outlier error."""
 
+<<<<<<< HEAD
     @pytest.mark.parametrize("feature_idx", [i for i in range(NUM_FEATURES) if i not in (4, 5, 6, 7)])
     def test_spiked_feature_is_selected(self, feature_idx):
         """When one non-time feature has a large outlier error in a single row,
         that row's reason code should point to the spiked feature."""
         errors = _baseline_errors(200)
         target_row = 42
+=======
+    @pytest.mark.parametrize("feature_idx", range(NUM_FEATURES))
+    def test_spiked_feature_is_selected(self, feature_idx):
+        """When one feature has a large outlier error in a single row, that row's
+        reason code should point to the spiked feature."""
+        errors = _baseline_errors(200)
+        target_row = 42
+        # Inject a spike much larger than anything else in that feature's column
+>>>>>>> origin/dev
         errors[target_row, feature_idx] += 5.0
         reasons = attribute_reason(errors)
         assert reasons[target_row] == feature_idx, (
@@ -332,6 +359,7 @@ class TestReasonAttribution:
             f"but got {reasons[target_row]} ({FEATURE_COLS[reasons[target_row]]})"
         )
 
+<<<<<<< HEAD
     @pytest.mark.parametrize("feature_idx", [4, 5, 6, 7])
     def test_time_features_never_selected(self, feature_idx):
         """Time features are masked to -inf and should never be selected."""
@@ -340,6 +368,8 @@ class TestReasonAttribution:
         reasons = attribute_reason(errors)
         assert reasons[42] not in (4, 5, 6, 7)
 
+=======
+>>>>>>> origin/dev
     @pytest.mark.parametrize("feature_idx", range(NUM_FEATURES))
     def test_reason_maps_to_known_string(self, feature_idx):
         assert feature_idx in REASON_MAP, f"Feature {feature_idx} has no reason label"
@@ -367,6 +397,7 @@ class TestReasonAttribution:
             f"Baseline should cause time dominance, but only {time_count}/500 rows were time"
         )
 
+<<<<<<< HEAD
     def test_each_non_time_reason_string_reachable(self):
         """Every non-time reason string must be reachable by spiking the
         corresponding feature."""
@@ -374,11 +405,22 @@ class TestReasonAttribution:
         for feature_idx in range(NUM_FEATURES):
             if feature_idx in (4, 5, 6, 7):
                 continue
+=======
+    def test_each_reason_string_reachable(self):
+        """Every reason string in the map must be reachable by spiking the
+        corresponding feature."""
+        seen_reasons = set()
+        for feature_idx in range(NUM_FEATURES):
+>>>>>>> origin/dev
             errors = _baseline_errors(100)
             errors[0, feature_idx] += 5.0
             reasons = attribute_reason(errors)
             seen_reasons.add(REASON_MAP[int(reasons[0])])
+<<<<<<< HEAD
         expected = {v for k, v in REASON_MAP.items() if k not in (4, 5, 6, 7)}
+=======
+        expected = set(REASON_MAP.values())
+>>>>>>> origin/dev
         assert seen_reasons == expected, f"Missing: {expected - seen_reasons}"
 
     def test_multiple_spikes_picks_largest(self):
@@ -481,6 +523,7 @@ def _train_autoencoder(model, data: np.ndarray, epochs: int = 30):
     model.eval()
 
 
+<<<<<<< HEAD
 # Feature weights matching ManualInferenceStage.FEATURE_WEIGHTS
 _FEATURE_WEIGHTS = [1.0] * NUM_FEATURES
 _FEATURE_WEIGHTS[4] = 0.0  # hour_sin — excluded
@@ -493,15 +536,24 @@ _TIME_INDICES = {4, 5, 6, 7}
 def _run_inference(model, data: np.ndarray):
     """Run the full ManualInferenceStage scoring + reason attribution on CPU.
     Returns (scores, reason_labels, raw_abs_errors) matching production logic."""
+=======
+def _run_inference(model, data: np.ndarray):
+    """Run the full ManualInferenceStage scoring + reason attribution on CPU.
+    Returns (scores, reason_labels) matching production logic."""
+>>>>>>> origin/dev
     means = model.saved_means.numpy()
     stds = model.saved_scales.numpy()
     normalized = (data - means) / stds
     input_t = torch.tensor(normalized, dtype=torch.float32)
+<<<<<<< HEAD
     weights = torch.tensor(_FEATURE_WEIGHTS, dtype=torch.float32)
+=======
+>>>>>>> origin/dev
 
     with torch.no_grad():
         reconstruction = model(input_t)
         abs_errors = torch.abs(input_t - reconstruction)
+<<<<<<< HEAD
 
         # Weighted scoring (time features down-weighted)
         weighted_errors = abs_errors * weights
@@ -510,14 +562,24 @@ def _run_inference(model, data: np.ndarray):
         loss = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
 
         # Reason attribution: mask time features to -inf so they can't be selected
+=======
+        max_err = torch.max(abs_errors, dim=1).values
+        mean_err = torch.mean(abs_errors, dim=1)
+        loss = (0.7 * mean_err + 0.3 * max_err).to(torch.float32)
+
+        # Relative reason attribution (matches production code)
+>>>>>>> origin/dev
         feat_median = torch.median(abs_errors, dim=0).values.unsqueeze(0)
         feat_iqr = (
             torch.quantile(abs_errors, 0.75, dim=0)
             - torch.quantile(abs_errors, 0.25, dim=0)
         ).unsqueeze(0).clamp(min=0.01)
         relative_errors = (abs_errors - feat_median) / feat_iqr
+<<<<<<< HEAD
         for ti in _TIME_INDICES:
             relative_errors[:, ti] = float('-inf')
+=======
+>>>>>>> origin/dev
         _, reason_indices = torch.max(relative_errors, dim=1)
 
     scores_np = loss.numpy()
@@ -720,10 +782,19 @@ class TestScenarioLateralMovement:
         _, labels, _ = _run_inference(self.model, self.anomaly_data)
         assert "User Anomaly" in labels, f"User Anomaly not in {set(labels)}"
 
+<<<<<<< HEAD
     def test_security_flag_detected(self):
         _, labels, _ = _run_inference(self.model, self.anomaly_data)
         assert "Security Flag" in labels, (
             f"Expected Security Flag in: {set(labels)}"
+=======
+    def test_security_flag_or_time_anomaly_detected(self):
+        _, labels, _ = _run_inference(self.model, self.anomaly_data)
+        has_security = "Security Flag" in labels
+        has_time = "Time Anomaly (Hour)" in labels
+        assert has_security or has_time, (
+            f"Expected Security Flag or Time Anomaly (Hour), got: {set(labels)}"
+>>>>>>> origin/dev
         )
 
     def test_multiple_reasons(self):
@@ -758,6 +829,7 @@ class TestScenarioCryptoMiner:
         assert "Process Anomaly" in labels, f"Process Anomaly not in {set(labels)}"
 
 
+<<<<<<< HEAD
 # ── Threat pattern matching (CPU-only, no torch) ────────────────────────────
 
 from collections import Counter
@@ -1012,6 +1084,8 @@ class TestThreatPatterns:
                 assert 0.0 < conf <= 1.0, f"{label} has invalid confidence {conf}"
 
 
+=======
+>>>>>>> origin/dev
 class TestEPSCalculation:
     def test_30_second_window(self):
         ts = pd.to_datetime(["2026-06-09 10:00:00", "2026-06-09 10:00:30"])
