@@ -19,15 +19,15 @@ echo "======================================================"
 
 case "${TEST_TIER:-all}" in
     unit)
-        exec python -m pytest tests/ -m "not gpu and not morpheus" -v ${PYTEST_ARGS:-}
+        exec python -m pytest tests/ -m "not gpu and not morpheus" -v "${PYTEST_ARGS:-}"
         ;;
     gpu)
-        exec python -m pytest tests/ -m "gpu and not morpheus" -v ${PYTEST_ARGS:-}
+        exec python -m pytest tests/ -m "gpu and not morpheus" -v "${PYTEST_ARGS:-}"
         ;;
     morpheus)
-        exec python -m pytest tests/ -m "morpheus" -v ${PYTEST_ARGS:-}
+        exec python -m pytest tests/ -m "morpheus" -v "${PYTEST_ARGS:-}"
         ;;
     all|*)
-        exec python -m pytest tests/ -v ${PYTEST_ARGS:-}
+        exec python -m pytest tests/ -v "${PYTEST_ARGS:-}"
         ;;
 esac
