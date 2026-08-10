@@ -1,3 +1,4 @@
+---
 # Test runner for the syslog-DFP pipeline.
 #
 # Runs inside the same image as production so tests exercise the real environment.
@@ -36,13 +37,13 @@ services:
     cap_add:
       - SYS_NICE          # same as production; avoids capability warnings in Morpheus
     environment:
-      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_VISIBLE_DEVICES: 'all'
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      PYTHONUNBUFFERED: "1"
-      TEST_TIER:   "${TEST_TIER:-all}"
-      PYTEST_ARGS: "${PYTEST_ARGS:-}"
+      PYTHONUNBUFFERED: '1'
+      TEST_TIER: '${TEST_TIER:-all}'
+      PYTEST_ARGS: '${PYTEST_ARGS:-}'
       # Point Morpheus model tracking at the isolated test volume (not production path).
-      MLFLOW_TRACKING_URI: "file:///app/models/dfp-models"
+      MLFLOW_TRACKING_URI: 'file:///app/models/dfp-models'
     volumes:
       # Mount the full source tree so tests pick up the current morpheus_app.py
       # and tests/ without requiring a container rebuild on every code change.
@@ -52,9 +53,9 @@ services:
       # preventing test runs from writing into the host working directory.
       - test-dfp-models:/app/models/dfp-models
     working_dir: /app
-    command: ["bash", "tests/run_tests.sh"]
+    command: ['bash', 'tests/run_tests.sh']
 
 volumes:
-  test-dfp-models:
-    # Named volume so model warm-up artifacts persist between runs (Tier 3 is faster
-    # on repeated runs).  To reset: docker compose -f docker-compose.test.yaml down -v
+  # Named volume so model warm-up artifacts persist between runs (Tier 3 is faster
+  # on repeated runs).  To reset: docker compose -f docker-compose.test.yaml down -v
+  test-dfp-models: { }

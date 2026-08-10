@@ -1,16 +1,10 @@
-FROM nvcr.io/nvidia/morpheus/morpheus:25.06-runtime
+# Use NVIDIA Morpheus Base Image
+FROM nvcr.io/nvidia/morpheus/morpheus:25.06-runtime AS base
 
 WORKDIR /app
 
-# FIX: Added '-y' to automatically accept the installation
-# FIX: Removed version pin for scikit-learn
-RUN conda install -y -c nvidia -c rapidsai -c conda-forge \
-    morpheus-dfp=25.06 \
-    mlflow \
-    prometheus_client \
-    && conda clean --all -f -y
-
-COPY morpheus_app.py .
+# Copy pipeline code
+COPY . .
 
 ENV PYTHONUNBUFFERED=1
 

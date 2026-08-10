@@ -1,0 +1,314 @@
+# ---------------------------------------------------------------------------
+# HALO STANDARD CHANGELOG
+#
+# STANDARD CATEGORIES:
+# - "🚀 Architecture & Infrastructure"
+# - "✨ New Features & Enhancements"
+# - "🎨 UI / UX Improvements"
+# - "🐛 Bug Fixes & Resilience"
+# - "🔒 Security & Auth"
+# - "🧹 Refactoring & Chores"
+# ---------------------------------------------------------------------------
+---
+- version: '0.2.6'
+  date: '2026-08-10'
+  author: 'Martin Kecka'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Optimized CI pipeline performance and stability by tuning Kaniko build arguments and increasing Kubernetes ephemeral storage limits.'
+        - 'Increased timeouts for security analysis tools to prevent pipeline failures during scanning.'
+        - 'Streamlined the Docker build process by optimizing base image usage and simplifying the application copy mechanism.'
+
+
+- version: '0.2.5'
+  date: '2026-07-23'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Implemented GitLab CI/CD pipeline configuration for automated container builds and deployment.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Introduced a Threat Pattern Matching engine to identify complex security events such as Brute Force, Lateral Movement, and Data Exfiltration based on anomaly sequences.'
+        - 'Expanded log parsing capabilities to support FortiOS key-value logs and RFC 5424 standards for more accurate host identification and timestamp extraction.'
+        - 'Implemented rolling window snapshotting to preserve training state and accelerate host re-qualification after service restarts.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Eliminated false positive anomaly triggers by masking cyclical time features from reconstruction scoring and reason attribution.'
+        - 'Updated the model learning state logic to enable anomaly scoring immediately after the first successful training cycle.'
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Reduced the model reload cooldown interval to improve GPU cache synchronization responsiveness.'
+
+
+- version: '0.2.4'
+  date: '2026-07-21'
+  author: 'Martin Kecka'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Integrated Prometheus monitoring to track pipeline event throughput and anomaly reconstruction loss.'
+        - 'Implemented a /metrics endpoint for real-time observability of the Morpheus pipeline.'
+
+
+- version: '0.2.3'
+  date: '2026-07-20'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Introduced environment variable support for Kafka batch size and edge buffer configuration to improve pipeline tuning.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Implemented relative error normalization for anomaly reason attribution, preventing cyclical time features from disproportionately dominating reason codes.'
+
+
+- version: '0.2.2'
+  date: '2026-06-18'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Optimized GPU memory allocation for H100 instances to provide additional headroom for large batch processing.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Increased Kafka consumer poll interval to prevent worker eviction during periods of high CPU utilization.'
+
+
+- version: '0.2.1'
+  date: '2026-06-17'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Externalized GPU memory pool and PyTorch memory fraction configurations via environment variables to support diverse hardware profiles.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Implemented an RMM failure callback to automatically flush GPU caches and retry allocations, preventing pipeline crashes during memory exhaustion.'
+        - 'Added proactive GPU memory monitoring to trigger cache clearing when usage exceeds 85%.'
+        - 'Improved Kafka sink stability by implementing delivery callbacks and retry logic for producer buffer overflows.'
+        - 'Adjusted service startup sequence to ensure health probes remain responsive during model warm-up and CUDA initialization.'
+
+
+- version: '0.2.0'
+  date: '2026-06-11'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Updated .gitignore patterns to exclude environment configurations and compiled Python bytecode.'
+
+
+- version: '0.1.9'
+  date: '2026-06-09'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Introduced a tiered testing framework (Unit, GPU, and Morpheus) with a dedicated Docker-based test runner for environment-specific validation.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Implemented a rolling window cache for host feature vectors, allowing the DFP models to learn from stable behavioral baselines rather than short-term batches.'
+        - 'Added support for RFC 5424 syslog timestamp parsing to improve temporal feature accuracy across different log formats.'
+        - 'Integrated dynamic label encoder loading for priority and event type normalization, replacing hardcoded class counts.'
+        - 'Added a classification tracking flag to ensure only successfully processed Triton inference results are used for model training.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Resolved column-size mismatch errors by enforcing unique indices during DataFrame concatenation and consolidating mutable dataframe contexts.'
+        - 'Fixed a race condition in the asynchronous training pipeline by ensuring normalization buffers are registered before signaling the inference engine.'
+        - 'Corrected EPS (Events Per Second) calculations to utilize actual batch timestamp ranges instead of fixed window estimates.'
+        - 'Improved hash feature distribution and stability by implementing absolute value normalization and increased modulo precision.'
+        - 'Prevented NaN values in training matrices by implementing default zero-filling for missing feedback and feature columns.'
+        - 'Ensured reliable data egress by adding a producer flush mechanism to the Kafka sink during object destruction.'
+
+
+- version: '0.1.8'
+  date: '2026-05-01'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Implemented Online Fine-Tuning via a new /feedback API, allowing users to mark specific anomalies as normal.'
+        - 'Added a Kafka-based control worker to broadcast user feedback across all distributed pipeline pods for synchronized model adaptation.'
+        - 'Introduced an automated model janitor to prune stale host models inactive for more than 48 hours to optimize disk usage.'
+        - 'Established a standardized anomaly scoring breakdown (0.0 to 10.0) to improve incident interpretation and response.'
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Migrated model serialization from MLflow to lightweight PyTorch .pt files, significantly reducing storage overhead per model.'
+        - 'Vectorized temporal feature calculations (sin/cos transforms) on the GPU to increase preprocessing throughput.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Enhanced model normalization logic with a robust standard deviation floor to prevent extreme anomaly spikes on discrete feature changes.'
+        - 'Implemented atomic write operations for feedback persistence to prevent JSON corruption during concurrent updates.'
+        - 'Refined the anomaly score scaling curve to provide smoother, more granular forensic detail.'
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Optimized the AutoEncoder bottleneck architecture to [12, 8] for more effective feature compression of the 19-dimensional vector.'
+        - 'Increased training epochs and adjusted save intervals to improve model convergence and stability.'
+
+
+- version: '0.1.7'
+  date: '2026-04-10'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Implemented log-scaling and normalization for feature mapping to prevent volume spikes from distorting anomaly scores.'
+        - 'Introduced robust normalization in the training stage by enforcing a standard deviation floor to reduce false positive anomaly triggers.'
+        - 'Refined the anomaly score scaling curve to provide smoother forensic detail and eliminate binary scoring behavior.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Added throttled diagnostic logging for inference scoring to improve observability of raw loss and learning states.'
+
+
+- version: '0.1.6'
+  date: '2026-04-09'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Repositioned the AccumulatorStage to the pipeline entry point to maximize throughput for downstream GPU preprocessing and Triton inference.'
+        - 'Updated KafkaSource configuration to utilize the latest offset reset policy.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Implemented a blended loss calculation (0.7 MAE + 0.3 Max Error) to better capture both general drift and extreme spikes in anomaly detection.'
+        - 'Introduced a refined non-linear scaling curve for anomaly scores to provide better forensic detail and eliminate binary 0.0/10.0 scoring behavior.'
+        - 'Enhanced performance observability in the AccumulatorStage by implementing windowed EPS (Events Per Second) logging.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Increased the scaling epsilon in AsyncTrainingStage to prevent low-variance features from triggering false positive anomaly scores.'
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Optimized ManualInferenceStage by reducing lock contention, gathering all required models in a single lock acquisition per batch.'
+        - 'Removed redundant internal buffering in ManualInferenceStage to leverage upstream accumulation.'
+        - 'Refactored StringTritonInferenceStage to inherit from SinglePortStage for improved pipeline consistency.'
+
+
+- version: '0.1.5'
+  date: '2026-04-08'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Implemented keyed Kafka production to ensure host-stickiness across partitions.'
+        - 'Transitioned Kafka consumer group IDs to configurable identifiers to enable multi-pod scaling across partitions.'
+        - 'Increased pipeline batch sizes and buffer limits to optimize system throughput.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Migrated inference post-processing and reason mapping to GPU-vectorized operations using CuPy and cuDF to reduce latency.'
+        - 'Implemented zero-copy data transfers between Triton inference outputs and cuDF dataframes.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Added explicit feature column mapping for Triton outputs to ensure downstream compatibility with the Manual Inference stage.'
+        - 'Implemented throttled logging for Triton inference calls to reduce system overhead and log noise.'
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Optimized Kafka serialization by switching to JSON-lines format for faster data transmission.'
+
+
+- version: '0.1.4'
+  date: '2026-04-07'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Implemented a dynamic model routing mechanism in ManualInferenceStage to utilize user-specific models from the global cache instead of a generic fallback.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Resolved string conversion errors in Triton inference by replacing Arrow-based numpy conversion with Pandas to avoid zero-copy restrictions.'
+        - 'Added URL sanitization for Triton gRPC clients to ensure connectivity regardless of protocol prefixes or trailing slashes.'
+        - 'Improved robustness of the consistency enforcement stage by adding validation for required dataframe columns to prevent runtime errors.'
+        - 'Adjusted normalization scale constants to improve numerical stability during the training stage.'
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Externalized the Triton inference model directory configuration via the INFERENCE_MODELS_DIR environment variable.'
+        - 'Added comprehensive diagnostic logging for Triton inference latency and output decoding samples.'
+
+
+- version: '0.1.3'
+  date: '2026-04-06'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Implemented a synchronization mechanism between the training stage and inference engine using global counters and event signaling to track model progression.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Enhanced GPU model readiness logging to include versioning metrics for improved observability.'
+
+
+- version: '0.1.2'
+  date: '2026-04-03'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Expanded the DFP model feature vector from 12 to 19 dimensions to improve detection granularity.'
+        - 'Implemented cyclical sine/cosine temporal encoding for hour and day to capture periodic patterns.'
+        - 'Added identity extraction for users and processes using GPU-accelerated hashing for feature engineering.'
+        - 'Introduced the GPUFeatureMappingStage to the pipeline for optimized feature alignment.'
+        - 'Enhanced anomaly attribution to specifically identify Time Anomalies (Hour) and Identity-based anomalies.'
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Integrated FastAPI to provide real-time health monitoring and pipeline status reporting.'
+        - 'Implemented a version-based maturity threshold, treating host profiles as "learning" until they reach version 5.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Introduced a TRAINING_LOCK to ensure thread-safe model fitting during asynchronous training.'
+        - 'Refined health check logic to accurately differentiate between pipeline startup, stalled states, and healthy operation.'
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Streamlined the model cache warm-up and memory management worker logic for reduced overhead.'
+        - 'Optimized the PythonKafkaSink producer configuration and message delivery loop.'
+        - 'Simplified internal pipeline stage implementations and reduced verbose logging.'
+
+
+- version: '0.1.1'
+  date: '2026-04-02'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Implemented GPU memory pooling via RMM and a background memory manager to prevent fragmentation and OOM errors.'
+        - 'Integrated a FastAPI-based health monitoring server to track pipeline status and detect processing stalls.'
+        - 'Added a global pipeline recovery loop to automatically restart the system upon encountering fatal errors.'
+        - 'Optimized Kafka egress throughput by replacing pandas JSON serialization with a high-speed dictionary-based approach.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Expanded the Digital Fingerprinting (DFP) feature set from 4 to 19 dimensions, adding cyclical temporal encoding, identity hashing, and semantic log content hashing.'
+        - 'Implemented a model warm-up mechanism to pre-load host-specific behavioral profiles into VRAM during startup.'
+        - 'Introduced a non-linear anomaly score scaling function to improve the differentiation of security signals.'
+        - 'Added detailed performance telemetry to the inference stage, providing granular timing for concatenation, hashing, and model execution.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Enhanced Triton Inference Server stability with a client reconnection mechanism and request retry logic.'
+        - 'Eliminated GPU-to-CPU data transfers in the Accumulator stage by maintaining dataframes in VRAM (Zero-Copy).'
+        - 'Added a hard buffer cap to the Accumulator stage to prevent memory spikes during high-volume bursts.'
+        - 'Implemented model version validation to automatically detect and migrate legacy models with incompatible feature dimensions.'
+        - 'Added fallback value injection to ensure pipeline continuity during Triton server outages.'
+    - category: '🧹 Refactoring & Chores'
+      items:
+        - 'Renamed GPUCleanRoomStage to GPUPreprocessingStage to better align with its functional role in the pipeline.'
+        - 'Updated system documentation and architectural specifications in README.md and GEMINI.md to reflect the new DFP pattern.'
+
+
+- version: '0.1.0'
+  date: '2026-03-26'
+  author: 'Scott Chrestman'
+  changes:
+    - category: '🚀 Architecture & Infrastructure'
+      items:
+        - 'Implemented a containerized deployment architecture using Docker Compose and NVIDIA Triton Inference Server for high-performance model serving.'
+        - 'Integrated MLflow for the tracking, versioning, and lifecycle management of source-specific AutoEncoder models.'
+        - 'Established a real-time data pipeline utilizing Kafka for scalable log ingestion and enriched data distribution.'
+    - category: '✨ New Features & Enhancements'
+      items:
+        - 'Developed a Morpheus-based inference pipeline for real-time log analysis and automated anomaly detection.'
+        - 'Implemented an asynchronous training mechanism to dynamically update anomaly detection models per data source.'
+        - 'Added a Triton ensemble model to simultaneously classify log priority, event type, and security status.'
+        - 'Created a GPU-accelerated preprocessing stage for extracting attacker IP addresses and simulating high-frequency event spikes for detection testing.'
+    - category: '🐛 Bug Fixes & Resilience'
+      items:
+        - 'Introduced logarithmic scaling for log volume features to normalize data and improve model stability across varying scales.'
+        - 'Implemented a consistency enforcement stage to resolve conflicts between security event flags and classification labels.'

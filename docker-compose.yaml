@@ -1,3 +1,4 @@
+---
 services:
   triton-server:
     build:
@@ -9,9 +10,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
     ports:
-      - "8889:8000" # HTTP
-      - "8007:8001" # gRPC
-      - "8002:8002" # Metrics
+      - '8889:8000' # HTTP
+      - '8007:8001' # gRPC
+      - '8002:8002' # Metrics
     volumes:
       - ./triton-models:/models/triton-model-repo
     command:
@@ -31,18 +32,18 @@ services:
       # H100 80GB: 4 GB for Triton (shared across all pipeline instances)
       - --backend-config=default:memory_pool_byte_size=4294967296
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      test: ['CMD', 'curl', '-f', 'http://localhost:8000/v2/health/ready']
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 30s
 
   morpheus-inference:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
     container_name: morpheus-inference
-    network_mode: "host"
+    network_mode: 'host'
     depends_on:
       triton-server:
         condition: service_healthy
@@ -56,10 +57,9 @@ services:
       MLFLOW_TRACKING_URI: file:///app/models/dfp-models
       # H100 80GB: 4 syslog-dfp + 2 netflow-dfp pods = 6 total (~68 GB)
       # syslog-dfp gets more headroom due to large batch sizes (pipeline_batch_size=32768)
-      RMM_POOL_MAX_GB: "7"
-      PYTORCH_MEMORY_FRACTION: "0.05"
+      RMM_POOL_MAX_GB: '7'
+      PYTORCH_MEMORY_FRACTION: '0.05'
     volumes:
       - ./morpheus_app.py:/app/morpheus_app.py
       - ./dfp-models:/app/models/dfp-models
     command: python /app/morpheus_app.py
-
