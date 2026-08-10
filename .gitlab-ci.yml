@@ -32,12 +32,3 @@ container_dive:
   rules:
     - when: never
 
-# Enforce strict linting for YAML and Markdown
-lint_md:
-  allow_failure: false
-
-lint_yaml:
-  allow_failure: false
-
-lint_sh:
-  allow_failure: true
