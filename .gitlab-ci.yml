@@ -31,4 +31,3 @@ update_annotations:
 container_dive:
   rules:
     - when: never
-

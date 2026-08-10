@@ -58,4 +58,4 @@ services:
 volumes:
   # Named volume so model warm-up artifacts persist between runs (Tier 3 is faster
   # on repeated runs).  To reset: docker compose -f docker-compose.test.yaml down -v
-  test-dfp-models: {}
+  test-dfp-models: { }
